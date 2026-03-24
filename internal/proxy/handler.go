@@ -132,7 +132,7 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger = logger.With("tailnet_ip", vm.TailnetIP, "gateway_port", vm.GatewayPort)
+	logger = logger.With("ip", vm.EffectiveIP(), "gateway_port", vm.GatewayPort)
 
 	// Upgrade client connection
 	clientConn, err := upgrader.Upgrade(w, r, nil)
@@ -180,12 +180,14 @@ func (h *Handler) isAdmin(email string) bool {
 // It injects the gateway token via query param and sets X-Forwarded-User
 // so the gateway recognizes this as a trusted-proxy connection.
 func (h *Handler) connectBackend(vm *registry.VMInfo, customerID string, logger *slog.Logger) (*websocket.Conn, error) {
-	// Build backend URL
-	backendURL := fmt.Sprintf("ws://%s:%d", vm.TailnetIP, vm.GatewayPort)
+	// Build backend URL — prefer tailnet_ip, fall back to public_ip
+	ip := vm.EffectiveIP()
+	backendURL := fmt.Sprintf("ws://%s:%d", ip, vm.GatewayPort)
 
 	// If we have a gateway token, pass it as query param for auth
-	if vm.GatewayToken != "" {
-		backendURL += "?token=" + vm.GatewayToken
+	token := vm.EffectiveToken()
+	if token != "" {
+		backendURL += "?token=" + token
 	}
 
 	// Set trusted-proxy headers so the gateway identifies the customer
@@ -194,8 +196,8 @@ func (h *Handler) connectBackend(vm *registry.VMInfo, customerID string, logger 
 	header.Set("X-Forwarded-Customer", customerID)
 
 	// Also pass gateway token as header for compatibility
-	if vm.GatewayToken != "" {
-		header.Set("X-OpenClaw-Token", vm.GatewayToken)
+	if token != "" {
+		header.Set("X-OpenClaw-Token", token)
 	}
 
 	dialer := websocket.Dialer{

@@ -38,6 +38,11 @@ func (m *mockRegistry) LookupByUserID(userID string) (*registry.VMInfo, error) {
 	return m.vm, m.err
 }
 
+// strPtr is a test helper for creating *string values.
+func strPtr(s string) *string { return &s }
+
+
+
 func newTestHandler(jwt JWTValidator, vms VMRegistry, opts ...func(*HandlerConfig)) *Handler {
 	cfg := HandlerConfig{
 		JWTValidator:   jwt,
@@ -165,7 +170,7 @@ func TestHandleWebSocket_Forbidden(t *testing.T) {
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "cust-1",
 			UserID:     "user-owner",
-			TailnetIP:  "100.64.0.1",
+			TailnetIP:  strPtr("100.64.0.1"),
 		}},
 	)
 	req := httptest.NewRequest("GET", "/vm/cust-1/", nil)
@@ -187,7 +192,7 @@ func TestHandleWebSocket_AdminBypass(t *testing.T) {
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "cust-1",
 			UserID:     "other-user",
-			TailnetIP:  "100.64.0.1",
+			TailnetIP:  strPtr("100.64.0.1"),
 		}},
 		func(cfg *HandlerConfig) {
 			cfg.AdminEmails = []string{"admin@100yen.org"}
@@ -288,9 +293,9 @@ func TestFullProxyCycle(t *testing.T) {
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:   "cust-1",
 			UserID:       "user-1",
-			TailnetIP:    backendHost,
+			TailnetIP:    strPtr(backendHost),
 			GatewayPort:  backendPort,
-			GatewayToken: "gw-secret-token",
+			GatewayToken: strPtr("gw-secret-token"),
 		}},
 	)
 

@@ -10,13 +10,31 @@ import (
 )
 
 // VMInfo contains the connection details for a customer's VM.
+// Field names match the actual Supabase customer_vms table schema.
 type VMInfo struct {
-	CustomerID   string `json:"customer_id"`
-	UserID       string `json:"user_id"`
-	TailnetIP    string `json:"tailnet_ip"`
-	GatewayPort  int    `json:"gateway_port"`
-	GatewayToken string `json:"gateway_token"`
-	Status       string `json:"status"`
+	CustomerID   string  `json:"customer_id"`
+	UserID       string  `json:"user_id"`
+	TailnetIP    *string `json:"tailnet_ip"`    // nullable — use PublicIP as fallback
+	PublicIP     string  `json:"public_ip"`
+	GatewayPort  int     `json:"openclaw_port"` // maps from openclaw_port column
+	GatewayToken *string `json:"gateway_token"` // nullable until provisioned
+	Status       string  `json:"status"`
+}
+
+// EffectiveIP returns the best IP to connect to: tailnet_ip if available, else public_ip.
+func (v *VMInfo) EffectiveIP() string {
+	if v.TailnetIP != nil && *v.TailnetIP != "" {
+		return *v.TailnetIP
+	}
+	return v.PublicIP
+}
+
+// EffectiveToken returns the gateway token or empty string if not set.
+func (v *VMInfo) EffectiveToken() string {
+	if v.GatewayToken != nil {
+		return *v.GatewayToken
+	}
+	return ""
 }
 
 type cacheEntry struct {

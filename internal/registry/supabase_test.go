@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+
+func strPtr(s string) *string { return &s }
+
 func TestLookupByCustomerID_CacheMiss(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -18,9 +21,9 @@ func TestLookupByCustomerID_CacheMiss(t *testing.T) {
 		vms := []VMInfo{{
 			CustomerID:   "cust-1",
 			UserID:       "user-1",
-			TailnetIP:    "100.64.0.1",
+			TailnetIP:    strPtr("100.64.0.1"),
 			GatewayPort:  18789,
-			GatewayToken: "tok-123",
+			GatewayToken: strPtr("tok-123"),
 			Status:       "active",
 		}}
 		json.NewEncoder(w).Encode(vms)
@@ -35,11 +38,11 @@ func TestLookupByCustomerID_CacheMiss(t *testing.T) {
 	if vm == nil {
 		t.Fatal("expected VM, got nil")
 	}
-	if vm.TailnetIP != "100.64.0.1" {
-		t.Errorf("expected 100.64.0.1, got %s", vm.TailnetIP)
+	if *vm.TailnetIP != "100.64.0.1" {
+		t.Errorf("expected 100.64.0.1, got %s", *vm.TailnetIP)
 	}
-	if vm.GatewayToken != "tok-123" {
-		t.Errorf("expected tok-123, got %s", vm.GatewayToken)
+	if *vm.GatewayToken != "tok-123" {
+		t.Errorf("expected tok-123, got %s", *vm.GatewayToken)
 	}
 	if callCount != 1 {
 		t.Errorf("expected 1 call, got %d", callCount)
@@ -50,7 +53,7 @@ func TestLookupByCustomerID_CacheHit(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: "100.64.0.1"}}
+		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: strPtr("100.64.0.1")}}
 		json.NewEncoder(w).Encode(vms)
 	}))
 	defer server.Close()
@@ -68,7 +71,7 @@ func TestLookupByCustomerID_CacheExpiry(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: "100.64.0.1"}}
+		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: strPtr("100.64.0.1")}}
 		json.NewEncoder(w).Encode(vms)
 	}))
 	defer server.Close()
@@ -102,7 +105,7 @@ func TestLookupByCustomerID_NoVMFound(t *testing.T) {
 func TestLookupByCustomerID_DefaultPort(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Return VM with no gateway_port (zero value)
-		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: "100.64.0.1", GatewayPort: 0}}
+		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: strPtr("100.64.0.1"), GatewayPort: 0}}
 		json.NewEncoder(w).Encode(vms)
 	}))
 	defer server.Close()
@@ -127,7 +130,7 @@ func TestLookupByUserID(t *testing.T) {
 		vms := []VMInfo{{
 			CustomerID: "cust-1",
 			UserID:     "user-1",
-			TailnetIP:  "100.64.0.1",
+			TailnetIP:  strPtr("100.64.0.1"),
 			GatewayPort: 18789,
 		}}
 		json.NewEncoder(w).Encode(vms)
