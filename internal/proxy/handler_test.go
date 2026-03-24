@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -347,5 +349,194 @@ func TestFullProxyCycle(t *testing.T) {
 	}
 	if string(reply) != "backend-reply" {
 		t.Errorf("client got %q, want 'backend-reply'", string(reply))
+	}
+}
+
+// --- H2: Per-user connection limit tests ---
+
+func TestHandleWebSocket_PerUserConnectionLimit(t *testing.T) {
+	// Create a backend that accepts WS connections and holds them open
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Hold connection open until client disconnects
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := NewHandler(HandlerConfig{
+		JWTValidator: &mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		VMRegistry: &mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr(backendHost),
+			GatewayPort:  backendPort,
+			GatewayToken: strPtr("tok"),
+		}},
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		MaxPerUser:     2, // allow max 2 connections per user
+		ConnectTimeout: 5 * time.Second,
+	})
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(h.HandleWebSocket))
+	defer proxyServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/vm/cust-1/"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer valid-token")
+
+	// Open 2 connections — should succeed
+	var conns []*websocket.Conn
+	for i := 0; i < 2; i++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+		if err != nil {
+			t.Fatalf("connection %d failed: %v", i+1, err)
+		}
+		conns = append(conns, conn)
+	}
+
+	// 3rd connection from same user should be rejected (503)
+	// Use a raw HTTP request since WS dial may not give us the status code
+	req, _ := http.NewRequest("GET", proxyServer.URL+"/vm/cust-1/", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("3rd request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for 3rd connection, got %d", resp.StatusCode)
+	}
+
+	// Close one connection and try again — should now succeed
+	conns[0].Close()
+	// Give a moment for the defer to run
+	time.Sleep(50 * time.Millisecond)
+
+	conn3, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("connection after release failed: %v", err)
+	}
+	conn3.Close()
+
+	// Cleanup
+	for _, c := range conns[1:] {
+		c.Close()
+	}
+}
+
+// --- H5: Backend reconnect with exponential backoff tests ---
+
+func TestConnectBackend_RetryOnFailure(t *testing.T) {
+	var mu sync.Mutex
+	dialCount := 0
+	failUntil := 2 // fail first 2, succeed on 3rd
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dialCount++
+		current := dialCount
+		mu.Unlock()
+
+		if current <= failUntil {
+			// Reject the WS upgrade with a non-101 status
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+
+		up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := NewHandler(HandlerConfig{
+		JWTValidator:      &mockJWT{},
+		VMRegistry:        &mockRegistry{},
+		Health:            health.NewHandler(),
+		MaxConnections:    100,
+		ConnectTimeout:    2 * time.Second,
+		ReconnectAttempts: 3,
+	})
+
+	vm := &registry.VMInfo{
+		CustomerID:  "cust-1",
+		TailnetIP:   strPtr(backendHost),
+		GatewayPort: backendPort,
+	}
+
+	conn, err := h.connectBackend(vm, "cust-1", slog.Default())
+	if err != nil {
+		t.Fatalf("connectBackend should succeed on 3rd attempt, got: %v", err)
+	}
+	conn.Close()
+
+	mu.Lock()
+	finalCount := dialCount
+	mu.Unlock()
+	if finalCount < 3 {
+		t.Errorf("expected at least 3 dial attempts, got %d", finalCount)
+	}
+}
+
+func TestConnectBackend_AllRetriesFail(t *testing.T) {
+	// Backend that always rejects
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "always down", http.StatusServiceUnavailable)
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := NewHandler(HandlerConfig{
+		JWTValidator:      &mockJWT{},
+		VMRegistry:        &mockRegistry{},
+		Health:            health.NewHandler(),
+		MaxConnections:    100,
+		ConnectTimeout:    1 * time.Second,
+		ReconnectAttempts: 2, // 2 attempts, both fail
+	})
+
+	vm := &registry.VMInfo{
+		CustomerID:  "cust-1",
+		TailnetIP:   strPtr(backendHost),
+		GatewayPort: backendPort,
+	}
+
+	_, err := h.connectBackend(vm, "cust-1", slog.Default())
+	if err == nil {
+		t.Fatal("expected error when all retries fail")
+	}
+	if !strings.Contains(err.Error(), "after 2 attempts") {
+		t.Errorf("expected error to mention attempts, got: %v", err)
 	}
 }

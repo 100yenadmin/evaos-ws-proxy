@@ -30,6 +30,7 @@ type Config struct {
 	BackendConnectTimeout    time.Duration
 	BackendReconnectAttempts int
 	MaxConnections           int
+	MaxConnectionsPerUser    int
 }
 
 func loadConfig() (*Config, error) {
@@ -43,6 +44,7 @@ func loadConfig() (*Config, error) {
 		BackendConnectTimeout:    parseDuration("BACKEND_CONNECT_TIMEOUT", 10*time.Second),
 		BackendReconnectAttempts: parseInt("BACKEND_RECONNECT_ATTEMPTS", 3),
 		MaxConnections:           parseInt("MAX_CONNECTIONS", 5000),
+		MaxConnectionsPerUser:    parseInt("MAX_CONNECTIONS_PER_USER", 10),
 	}
 
 	if emails := os.Getenv("ADMIN_EMAILS"); emails != "" {
@@ -82,7 +84,12 @@ func main() {
 
 	// Build dependencies
 	jwtValidator := auth.NewJWTValidator(cfg.SupabaseJWTSecret)
-	vmRegistry := registry.NewSupabaseRegistry(cfg.SupabaseURL, cfg.SupabaseServiceKey, cfg.VMCacheTTL)
+
+	// Create a cancellable context for background goroutines (e.g., cache sweep)
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+
+	vmRegistry := registry.NewSupabaseRegistry(appCtx, cfg.SupabaseURL, cfg.SupabaseServiceKey, cfg.VMCacheTTL)
 	healthHandler := health.NewHandler()
 
 	proxyHandler := proxy.NewHandler(proxy.HandlerConfig{
@@ -93,6 +100,7 @@ func main() {
 		ConnectTimeout:    cfg.BackendConnectTimeout,
 		ReconnectAttempts: cfg.BackendReconnectAttempts,
 		MaxConnections:    cfg.MaxConnections,
+		MaxPerUser:        cfg.MaxConnectionsPerUser,
 	})
 
 	// Routes

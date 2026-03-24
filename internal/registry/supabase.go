@@ -1,9 +1,11 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sync"
@@ -55,13 +57,47 @@ type SupabaseRegistry struct {
 }
 
 // NewSupabaseRegistry creates a registry backed by Supabase PostgREST.
-func NewSupabaseRegistry(baseURL, serviceKey string, cacheTTL time.Duration) *SupabaseRegistry {
-	return &SupabaseRegistry{
+// The ctx parameter controls the lifecycle of the background cache sweep goroutine.
+func NewSupabaseRegistry(ctx context.Context, baseURL, serviceKey string, cacheTTL time.Duration) *SupabaseRegistry {
+	r := &SupabaseRegistry{
 		baseURL:    baseURL,
 		serviceKey: serviceKey,
 		cacheTTL:   cacheTTL,
 		client:     &http.Client{Timeout: 10 * time.Second},
 		cache:      make(map[string]*cacheEntry),
+	}
+	go r.sweepLoop(ctx)
+	return r
+}
+
+// sweepLoop periodically removes expired cache entries.
+func (r *SupabaseRegistry) sweepLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.sweep()
+		}
+	}
+}
+
+// sweep removes all expired entries from the cache.
+func (r *SupabaseRegistry) sweep() {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	swept := 0
+	for key, entry := range r.cache {
+		if now.After(entry.expiresAt) {
+			delete(r.cache, key)
+			swept++
+		}
+	}
+	if swept > 0 {
+		slog.Debug("cache sweep completed", "swept", swept)
 	}
 }
 

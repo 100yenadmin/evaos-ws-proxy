@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/100yenadmin/evaos-ws-proxy/internal/auth"
@@ -58,6 +59,7 @@ type HandlerConfig struct {
 	ConnectTimeout    time.Duration
 	ReconnectAttempts int
 	MaxConnections    int
+	MaxPerUser        int
 }
 
 // Handler manages WebSocket proxy connections.
@@ -69,6 +71,8 @@ type Handler struct {
 	connectTimeout    time.Duration
 	reconnectAttempts int
 	maxConnections    int
+	maxPerUser        int
+	userConns         sync.Map // map[string]*atomic.Int64
 }
 
 // NewHandler creates a new proxy handler.
@@ -76,6 +80,10 @@ func NewHandler(cfg HandlerConfig) *Handler {
 	adminSet := make(map[string]bool, len(cfg.AdminEmails))
 	for _, e := range cfg.AdminEmails {
 		adminSet[strings.ToLower(e)] = true
+	}
+	maxPerUser := cfg.MaxPerUser
+	if maxPerUser <= 0 {
+		maxPerUser = 10 // default
 	}
 	return &Handler{
 		jwt:               cfg.JWTValidator,
@@ -85,6 +93,30 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		connectTimeout:    cfg.ConnectTimeout,
 		reconnectAttempts: cfg.ReconnectAttempts,
 		maxConnections:    cfg.MaxConnections,
+		maxPerUser:        maxPerUser,
+	}
+}
+
+// acquireUserConn increments the per-user connection counter and returns true if allowed.
+func (h *Handler) acquireUserConn(userID string) bool {
+	val, _ := h.userConns.LoadOrStore(userID, &atomic.Int64{})
+	counter := val.(*atomic.Int64)
+	for {
+		cur := counter.Load()
+		if cur >= int64(h.maxPerUser) {
+			return false
+		}
+		if counter.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// releaseUserConn decrements the per-user connection counter.
+func (h *Handler) releaseUserConn(userID string) {
+	if val, ok := h.userConns.Load(userID); ok {
+		counter := val.(*atomic.Int64)
+		counter.Add(-1)
 	}
 }
 
@@ -128,6 +160,22 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check per-user connection limit
+	if !h.acquireUserConn(claims.UserID) {
+		slog.Warn("per-user connection limit reached",
+			"user_id", claims.UserID, "max_per_user", h.maxPerUser)
+		http.Error(w, "too many connections for user", http.StatusServiceUnavailable)
+		return
+	}
+	// Will be released in the defer after WS upgrade succeeds.
+	// If we return early (before upgrade), release here.
+	userConnAcquired := true
+	defer func() {
+		if userConnAcquired {
+			h.releaseUserConn(claims.UserID)
+		}
+	}()
+
 	logger := slog.With(
 		"user_id", claims.UserID,
 		"customer_id", customerID,
@@ -170,6 +218,7 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		clientConn.Close()
 		h.health.RemoveConnection()
+		// userConnAcquired release is handled by the earlier defer
 		logger.Info("client disconnected")
 	}()
 
@@ -199,7 +248,7 @@ func (h *Handler) isAdmin(email string) bool {
 	return h.adminEmails[strings.ToLower(email)]
 }
 
-// connectBackend dials the backend gateway WebSocket.
+// connectBackend dials the backend gateway WebSocket with retry and exponential backoff.
 // It injects the gateway token via query param and sets X-Forwarded-User
 // so the gateway recognizes this as a trusted-proxy connection.
 func (h *Handler) connectBackend(vm *registry.VMInfo, customerID string, logger *slog.Logger) (*websocket.Conn, error) {
@@ -227,12 +276,30 @@ func (h *Handler) connectBackend(vm *registry.VMInfo, customerID string, logger 
 		HandshakeTimeout: h.connectTimeout,
 	}
 
-	conn, _, err := dialer.Dial(backendURL, header)
-	if err != nil {
-		return nil, fmt.Errorf("dial backend: %w", err)
+	var lastErr error
+	maxAttempts := h.reconnectAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1 // at least one attempt
 	}
 
-	return conn, nil
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Second * time.Duration(1<<(attempt-1)) // 1s, 2s, 4s, ...
+			logger.Warn("retrying backend connection",
+				"attempt", attempt+1, "max_attempts", maxAttempts, "backoff", backoff)
+			time.Sleep(backoff)
+		}
+
+		conn, _, err := dialer.Dial(backendURL, header)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		logger.Warn("backend dial failed",
+			"attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
+	}
+
+	return nil, fmt.Errorf("dial backend after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func (h *Handler) proxyBidirectional(client, backend *websocket.Conn, vm *registry.VMInfo, logger *slog.Logger) {

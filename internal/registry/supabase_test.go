@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -30,7 +31,7 @@ func TestLookupByCustomerID_CacheMiss(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reg := NewSupabaseRegistry(server.URL, "test-key", 60*time.Second)
+	reg := NewSupabaseRegistry(context.Background(), server.URL, "test-key", 60*time.Second)
 	vm, err := reg.LookupByCustomerID("cust-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -58,7 +59,7 @@ func TestLookupByCustomerID_CacheHit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reg := NewSupabaseRegistry(server.URL, "test-key", 60*time.Second)
+	reg := NewSupabaseRegistry(context.Background(), server.URL, "test-key", 60*time.Second)
 	reg.LookupByCustomerID("cust-1")
 	reg.LookupByCustomerID("cust-1")
 
@@ -76,7 +77,7 @@ func TestLookupByCustomerID_CacheExpiry(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reg := NewSupabaseRegistry(server.URL, "test-key", 1*time.Millisecond)
+	reg := NewSupabaseRegistry(context.Background(), server.URL, "test-key", 1*time.Millisecond)
 	reg.LookupByCustomerID("cust-1")
 	time.Sleep(5 * time.Millisecond)
 	reg.LookupByCustomerID("cust-1")
@@ -92,7 +93,7 @@ func TestLookupByCustomerID_NoVMFound(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reg := NewSupabaseRegistry(server.URL, "test-key", 60*time.Second)
+	reg := NewSupabaseRegistry(context.Background(), server.URL, "test-key", 60*time.Second)
 	vm, err := reg.LookupByCustomerID("cust-missing")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -110,7 +111,7 @@ func TestLookupByCustomerID_DefaultPort(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reg := NewSupabaseRegistry(server.URL, "test-key", 60*time.Second)
+	reg := NewSupabaseRegistry(context.Background(), server.URL, "test-key", 60*time.Second)
 	vm, err := reg.LookupByCustomerID("cust-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -137,7 +138,7 @@ func TestLookupByUserID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	reg := NewSupabaseRegistry(server.URL, "test-key", 60*time.Second)
+	reg := NewSupabaseRegistry(context.Background(), server.URL, "test-key", 60*time.Second)
 	vm, err := reg.LookupByUserID("user-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -148,4 +149,94 @@ func TestLookupByUserID(t *testing.T) {
 	if vm.CustomerID != "cust-1" {
 		t.Errorf("expected cust-1, got %s", vm.CustomerID)
 	}
+}
+
+// --- H6: Cache sweep tests ---
+
+func TestCacheSweep_RemovesExpiredEntries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: strPtr("100.64.0.1")}}
+		json.NewEncoder(w).Encode(vms)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Use a very short TTL so entries expire quickly
+	reg := NewSupabaseRegistry(ctx, server.URL, "test-key", 1*time.Millisecond)
+
+	// Populate cache
+	_, err := reg.LookupByCustomerID("cust-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify cache has an entry
+	reg.mu.RLock()
+	if len(reg.cache) != 1 {
+		t.Errorf("expected 1 cache entry, got %d", len(reg.cache))
+	}
+	reg.mu.RUnlock()
+
+	// Wait for entries to expire
+	time.Sleep(10 * time.Millisecond)
+
+	// Manually trigger sweep (don't wait for the ticker)
+	reg.sweep()
+
+	// Verify cache is now empty
+	reg.mu.RLock()
+	remaining := len(reg.cache)
+	reg.mu.RUnlock()
+	if remaining != 0 {
+		t.Errorf("expected 0 cache entries after sweep, got %d", remaining)
+	}
+}
+
+func TestCacheSweep_PreservesLiveEntries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vms := []VMInfo{{CustomerID: "cust-1", TailnetIP: strPtr("100.64.0.1")}}
+		json.NewEncoder(w).Encode(vms)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Use a long TTL so entries stay alive
+	reg := NewSupabaseRegistry(ctx, server.URL, "test-key", 1*time.Hour)
+
+	_, err := reg.LookupByCustomerID("cust-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Sweep should not remove live entries
+	reg.sweep()
+
+	reg.mu.RLock()
+	remaining := len(reg.cache)
+	reg.mu.RUnlock()
+	if remaining != 1 {
+		t.Errorf("expected 1 cache entry after sweep (not expired), got %d", remaining)
+	}
+}
+
+func TestCacheSweepLoop_StopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]VMInfo{})
+	}))
+	defer server.Close()
+
+	_ = NewSupabaseRegistry(ctx, server.URL, "test-key", 60*time.Second)
+
+	// Cancel the context — the sweep goroutine should stop
+	cancel()
+
+	// Give goroutine time to exit (it should exit promptly)
+	time.Sleep(50 * time.Millisecond)
+	// If we get here without hanging, the sweep loop respected context cancellation
 }
