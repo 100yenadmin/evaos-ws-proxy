@@ -266,6 +266,9 @@ func (h *Handler) connectBackend(vm *registry.VMInfo, customerID string, logger 
 	header := http.Header{}
 	header.Set("X-Forwarded-User", customerID)
 	header.Set("X-Forwarded-Customer", customerID)
+	// Set Origin to match the proxy's own origin so the gateway's
+	// allowedOrigins check passes (browser Origin is not forwarded).
+	header.Set("Origin", "https://ecs.electricsheephq.com")
 
 	// Also pass gateway token as header for compatibility
 	if token != "" {
