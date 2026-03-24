@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"fmt"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -18,8 +19,15 @@ type JWTValidator struct {
 }
 
 // NewJWTValidator creates a validator with the given HMAC secret.
+// The secret may be base64-encoded (as Supabase provides it) or raw.
 func NewJWTValidator(secret string) *JWTValidator {
-	return &JWTValidator{secret: []byte(secret)}
+	// Try base64 decode first (Supabase JWT secrets are base64-encoded)
+	decoded, err := base64.StdEncoding.DecodeString(secret)
+	if err != nil {
+		// Not valid base64 — use as raw bytes
+		decoded = []byte(secret)
+	}
+	return &JWTValidator{secret: decoded}
 }
 
 // Validate parses and validates a JWT string, returning the extracted claims.
