@@ -97,10 +97,13 @@ func main() {
 
 	// Routes
 	mux := http.NewServeMux()
-	// /vm/{customer_id}/ — WebSocket proxy (path-based routing)
-	mux.HandleFunc("/vm/", proxyHandler.HandleWebSocket)
-	// Health check
+	// Health check (registered first — more specific)
 	mux.HandleFunc("/health", healthHandler.HandleHealth)
+	// WebSocket proxy — handles both:
+	//   /vm/{customer_id}/  (direct access)
+	//   /{customer_id}/     (after Traefik strips /vm prefix)
+	mux.HandleFunc("/vm/", proxyHandler.HandleWebSocket)
+	mux.HandleFunc("/", proxyHandler.HandleWebSocket)
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
