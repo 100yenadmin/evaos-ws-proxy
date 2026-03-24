@@ -22,7 +22,7 @@ func TestValidate_ValidToken(t *testing.T) {
 		"exp":   float64(time.Now().Add(time.Hour).Unix()),
 	}, testSecret)
 
-	v := NewJWTValidator(testSecret)
+	v := NewJWTValidator(testSecret, "")
 	claims, err := v.Validate(tokenStr)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -41,7 +41,7 @@ func TestValidate_ExpiredToken(t *testing.T) {
 		"exp": float64(time.Now().Add(-time.Hour).Unix()),
 	}, testSecret)
 
-	v := NewJWTValidator(testSecret)
+	v := NewJWTValidator(testSecret, "")
 	_, err := v.Validate(tokenStr)
 	if err == nil {
 		t.Fatal("expected error for expired token")
@@ -54,7 +54,7 @@ func TestValidate_WrongSecret(t *testing.T) {
 		"exp": float64(time.Now().Add(time.Hour).Unix()),
 	}, "wrong-secret")
 
-	v := NewJWTValidator(testSecret)
+	v := NewJWTValidator(testSecret, "")
 	_, err := v.Validate(tokenStr)
 	if err == nil {
 		t.Fatal("expected error for wrong secret")
@@ -67,7 +67,7 @@ func TestValidate_MissingSub(t *testing.T) {
 		"exp":   float64(time.Now().Add(time.Hour).Unix()),
 	}, testSecret)
 
-	v := NewJWTValidator(testSecret)
+	v := NewJWTValidator(testSecret, "")
 	_, err := v.Validate(tokenStr)
 	if err == nil {
 		t.Fatal("expected error for missing sub")
@@ -80,7 +80,7 @@ func TestValidate_NoEmail(t *testing.T) {
 		"exp": float64(time.Now().Add(time.Hour).Unix()),
 	}, testSecret)
 
-	v := NewJWTValidator(testSecret)
+	v := NewJWTValidator(testSecret, "")
 	claims, err := v.Validate(tokenStr)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)

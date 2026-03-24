@@ -62,9 +62,8 @@ func loadConfig() (*Config, error) {
 	if cfg.SupabaseServiceKey == "" {
 		return nil, fmt.Errorf("SUPABASE_SERVICE_KEY is required")
 	}
-	if cfg.SupabaseJWTSecret == "" {
-		return nil, fmt.Errorf("SUPABASE_JWT_SECRET is required")
-	}
+	// SUPABASE_JWT_SECRET is optional — JWKS (ES256) is the primary auth path.
+	// The secret is only needed for legacy HS256 tokens.
 
 	return cfg, nil
 }
@@ -83,7 +82,9 @@ func main() {
 	slog.SetDefault(logger)
 
 	// Build dependencies
-	jwtValidator := auth.NewJWTValidator(cfg.SupabaseJWTSecret)
+	// Build JWKS URL from Supabase project URL
+	jwksURL := cfg.SupabaseURL + "/auth/v1/.well-known/jwks.json"
+	jwtValidator := auth.NewJWTValidator(cfg.SupabaseJWTSecret, jwksURL)
 
 	// Create a cancellable context for background goroutines (e.g., cache sweep)
 	appCtx, appCancel := context.WithCancel(context.Background())
