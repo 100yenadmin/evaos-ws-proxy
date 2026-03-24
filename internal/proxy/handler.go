@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,9 +15,26 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// customerIDPattern validates customer_id format: alphanumeric, hyphens, underscores (slug or UUID).
+var customerIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
+
+// allowedOrigins for WebSocket CORS check.
+var allowedOrigins = map[string]bool{
+	"https://electricsheephq.com":     true,
+	"https://www.electricsheephq.com": true,
+	"http://localhost:5173":           true, // Vite dev
+	"http://localhost:3000":           true,
+}
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin:    func(r *http.Request) bool { return true }, // CORS handled by Caddy
-	ReadBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // Non-browser clients (curl, etc.)
+		}
+		return allowedOrigins[origin]
+	},
+	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 }
 
@@ -80,11 +98,16 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract customer_id from path: /vm/{customer_id}/...
+	// Extract and validate customer_id from path: /vm/{customer_id}/...
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" {
 		slog.Info("missing customer_id in path", "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 		http.Error(w, "missing customer_id", http.StatusBadRequest)
+		return
+	}
+	if !customerIDPattern.MatchString(customerID) {
+		slog.Warn("invalid customer_id format", "customer_id", customerID, "remote_addr", r.RemoteAddr)
+		http.Error(w, "invalid customer_id", http.StatusBadRequest)
 		return
 	}
 

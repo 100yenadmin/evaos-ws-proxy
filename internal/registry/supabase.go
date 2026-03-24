@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -81,11 +82,16 @@ func (r *SupabaseRegistry) LookupByCustomerID(customerID string) (*VMInfo, error
 		return nil, err
 	}
 
-	// Cache result (including nil — negative cache)
+	// Cache positive results only — negative results use short TTL to avoid
+	// poisoning during onboarding (customer row may be added seconds later)
 	r.mu.Lock()
+	ttl := r.cacheTTL
+	if vm == nil {
+		ttl = 5 * time.Second // Short negative cache
+	}
 	r.cache[customerID] = &cacheEntry{
 		vm:        vm,
-		expiresAt: time.Now().Add(r.cacheTTL),
+		expiresAt: time.Now().Add(ttl),
 	}
 	r.mu.Unlock()
 
@@ -94,15 +100,15 @@ func (r *SupabaseRegistry) LookupByCustomerID(customerID string) (*VMInfo, error
 
 // LookupByUserID finds the active VM for a given user_id.
 func (r *SupabaseRegistry) LookupByUserID(userID string) (*VMInfo, error) {
-	url := fmt.Sprintf("%s/rest/v1/customer_vms?user_id=eq.%s&status=eq.active&select=*",
-		r.baseURL, userID)
-	return r.doQuery(url)
+	queryURL := fmt.Sprintf("%s/rest/v1/customer_vms?user_id=eq.%s&status=eq.active&select=*",
+		r.baseURL, url.QueryEscape(userID))
+	return r.doQuery(queryURL)
 }
 
 func (r *SupabaseRegistry) fetchByCustomerID(customerID string) (*VMInfo, error) {
-	url := fmt.Sprintf("%s/rest/v1/customer_vms?customer_id=eq.%s&status=eq.active&select=*",
-		r.baseURL, customerID)
-	return r.doQuery(url)
+	queryURL := fmt.Sprintf("%s/rest/v1/customer_vms?customer_id=eq.%s&status=eq.active&select=*",
+		r.baseURL, url.QueryEscape(customerID))
+	return r.doQuery(queryURL)
 }
 
 func (r *SupabaseRegistry) doQuery(url string) (*VMInfo, error) {
