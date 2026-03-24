@@ -255,19 +255,23 @@ func (h *Handler) forwardFrames(src, dst *websocket.Conn, direction string, logg
 	}
 }
 
-// extractCustomerID extracts the customer_id from a path like /vm/{customer_id}/...
+// extractCustomerID extracts the customer_id from a path.
+// Supports both /vm/{customer_id}/... (direct) and /{customer_id}/... (after Traefik strip-prefix).
 func extractCustomerID(path string) string {
-	// Trim leading slash, split
 	path = strings.TrimPrefix(path, "/")
-	parts := strings.SplitN(path, "/", 3) // ["vm", "{customer_id}", "..."]
-	if len(parts) < 2 || parts[0] != "vm" {
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) == 0 || parts[0] == "" {
 		return ""
 	}
-	id := parts[1]
-	if id == "" {
-		return ""
+	// If first segment is "vm", customer_id is second segment
+	if parts[0] == "vm" {
+		if len(parts) < 2 || parts[1] == "" {
+			return ""
+		}
+		return parts[1]
 	}
-	return id
+	// Otherwise first segment IS the customer_id (Traefik stripped /vm)
+	return parts[0]
 }
 
 // extractToken gets the JWT from Authorization header, token query param, or cookie.

@@ -69,7 +69,7 @@ func TestExtractCustomerID(t *testing.T) {
 		{"/vm/abc-def-ghi/extra/path", "abc-def-ghi"},
 		{"/vm/", ""},
 		{"/vm", ""},
-		{"/other/path", ""},
+		{"/other/path", "other"}, // strip-prefix mode: first segment is customer_id
 		{"/", ""},
 		{"", ""},
 	}
