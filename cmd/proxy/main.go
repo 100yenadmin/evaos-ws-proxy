@@ -108,11 +108,14 @@ func main() {
 	mux := http.NewServeMux()
 	// Health check (registered first — more specific)
 	mux.HandleFunc("/health", healthHandler.HandleHealth)
-	// WebSocket proxy — handles both:
+	// Combined WebSocket + HTTP proxy — dispatches based on Upgrade header.
+	// Handles both:
 	//   /vm/{customer_id}/  (direct access)
 	//   /{customer_id}/     (after Traefik strips /vm prefix)
-	mux.HandleFunc("/vm/", proxyHandler.HandleWebSocket)
-	mux.HandleFunc("/", proxyHandler.HandleWebSocket)
+	// WebSocket upgrade requests → HandleWebSocket (existing)
+	// Regular HTTP requests → HandleHTTPProxy (static asset proxying)
+	mux.Handle("/vm/", proxyHandler)
+	mux.Handle("/", proxyHandler)
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,

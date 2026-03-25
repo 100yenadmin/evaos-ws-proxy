@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -775,6 +776,386 @@ func TestConnectFrameTokenInjection_NoToken(t *testing.T) {
 
 	if received != originalMsg {
 		t.Errorf("got %q, want %q (no-token path should not modify frame)", received, originalMsg)
+	}
+}
+
+// --- HTTP Proxy tests ---
+
+func TestStripVMPrefix(t *testing.T) {
+	tests := []struct {
+		path       string
+		customerID string
+		expected   string
+	}{
+		{"/vm/cust-1/ui/index.html", "cust-1", "/ui/index.html"},
+		{"/vm/cust-1/ui/", "cust-1", "/ui"},
+		{"/vm/cust-1/ui/assets/style.css", "cust-1", "/ui/assets/style.css"},
+		{"/vm/cust-1/", "cust-1", "/"},
+		{"/vm/cust-1", "cust-1", "/"},
+		{"/cust-1/ui/index.html", "cust-1", "/ui/index.html"}, // Traefik strip mode
+		{"/cust-1/", "cust-1", "/"},
+		{"/cust-1", "cust-1", "/"},
+	}
+	for _, tt := range tests {
+		got := stripVMPrefix(tt.path, tt.customerID)
+		if got != tt.expected {
+			t.Errorf("stripVMPrefix(%q, %q) = %q, want %q", tt.path, tt.customerID, got, tt.expected)
+		}
+	}
+}
+
+func TestStripTokenParam(t *testing.T) {
+	tests := []struct {
+		raw      string
+		expected string
+	}{
+		{"token=abc&foo=bar", "foo=bar"},
+		{"foo=bar", "foo=bar"},
+		{"token=abc", ""},
+		{"", ""},
+		{"a=1&token=secret&b=2", "a=1&b=2"},
+	}
+	for _, tt := range tests {
+		got := stripTokenParam(tt.raw)
+		if got != tt.expected {
+			t.Errorf("stripTokenParam(%q) = %q, want %q", tt.raw, got, tt.expected)
+		}
+	}
+}
+
+func TestIsWebSocketUpgrade(t *testing.T) {
+	tests := []struct {
+		name       string
+		upgrade    string
+		connection string
+		expected   bool
+	}{
+		{"ws upgrade", "websocket", "Upgrade", true},
+		{"ws mixed case", "WebSocket", "upgrade", true},
+		{"no upgrade", "", "", false},
+		{"http only", "", "keep-alive", false},
+		{"upgrade no ws", "h2c", "Upgrade", false},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", "/vm/cust-1/", nil)
+		if tt.upgrade != "" {
+			req.Header.Set("Upgrade", tt.upgrade)
+		}
+		if tt.connection != "" {
+			req.Header.Set("Connection", tt.connection)
+		}
+		if got := isWebSocketUpgrade(req); got != tt.expected {
+			t.Errorf("isWebSocketUpgrade(%s) = %v, want %v", tt.name, got, tt.expected)
+		}
+	}
+}
+
+func TestHandleHTTPProxy_NoToken(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{})
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_InvalidToken(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{err: fmt.Errorf("invalid token")},
+		&mockRegistry{},
+	)
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.Header.Set("Authorization", "Bearer bad-token")
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_NoVM(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: nil},
+	)
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_Forbidden(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-wrong", Email: "hacker@evil.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-owner",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+	)
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_ForwardsRequest(t *testing.T) {
+	// Mock backend HTTP server that records what it received
+	var receivedPath string
+	var receivedHeaders http.Header
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html>Hello from gateway</html>"))
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr(backendHost),
+			GatewayPort:  backendPort,
+			GatewayToken: strPtr("gw-secret"),
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	// Verify response
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if body != "<html>Hello from gateway</html>" {
+		t.Errorf("unexpected body: %s", body)
+	}
+
+	// Verify the backend received the stripped path
+	if receivedPath != "/ui/index.html" {
+		t.Errorf("backend got path %q, want /ui/index.html", receivedPath)
+	}
+
+	// Verify trusted-proxy headers were set
+	if got := receivedHeaders.Get("X-Forwarded-User"); got != "cust-1" {
+		t.Errorf("X-Forwarded-User = %q, want 'cust-1'", got)
+	}
+	if got := receivedHeaders.Get("X-Forwarded-Customer"); got != "cust-1" {
+		t.Errorf("X-Forwarded-Customer = %q, want 'cust-1'", got)
+	}
+	if got := receivedHeaders.Get("X-Openclaw-Token"); got != "gw-secret" {
+		t.Errorf("X-OpenClaw-Token = %q, want 'gw-secret'", got)
+	}
+	// Auth header should be stripped (don't leak JWT to backend)
+	if got := receivedHeaders.Get("Authorization"); got != "" {
+		t.Errorf("Authorization header should be stripped, got %q", got)
+	}
+}
+
+func TestHandleHTTPProxy_StripsTokenQueryParam(t *testing.T) {
+	var receivedQuery string
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr(backendHost),
+			GatewayPort: backendPort,
+		}},
+	)
+
+	// Include token in query params — it should be stripped before forwarding
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html?token=supabase-jwt&theme=dark", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if strings.Contains(receivedQuery, "token=") {
+		t.Errorf("token should be stripped from query, got %q", receivedQuery)
+	}
+	if !strings.Contains(receivedQuery, "theme=dark") {
+		t.Errorf("non-token params should be preserved, got %q", receivedQuery)
+	}
+}
+
+func TestHandleHTTPProxy_CacheHeaders(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ext := strings.ToLower(r.URL.Path)
+		switch {
+		case strings.HasSuffix(ext, ".html"):
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		case strings.HasSuffix(ext, ".js"):
+			w.Header().Set("Content-Type", "application/javascript")
+		case strings.HasSuffix(ext, ".css"):
+			w.Header().Set("Content-Type", "text/css")
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("content"))
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr(backendHost),
+			GatewayPort: backendPort,
+		}},
+	)
+
+	tests := []struct {
+		path          string
+		expectCache   string
+	}{
+		{"/vm/cust-1/ui/index.html", "no-cache, no-store, must-revalidate"},
+		{"/vm/cust-1/ui/app.js", "public, max-age=86400, immutable"},
+		{"/vm/cust-1/ui/style.css", "public, max-age=86400, immutable"},
+	}
+
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", tt.path, nil)
+		req.Header.Set("Authorization", "Bearer valid-token")
+		w := httptest.NewRecorder()
+		h.HandleHTTPProxy(w, req)
+
+		got := w.Header().Get("Cache-Control")
+		if got != tt.expectCache {
+			t.Errorf("Cache-Control for %s = %q, want %q", tt.path, got, tt.expectCache)
+		}
+	}
+}
+
+func TestHandleHTTPProxy_BackendDown(t *testing.T) {
+	// Point to a port that's not listening
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999, // not listening
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", w.Code)
+	}
+}
+
+// TestServeHTTP_DispatchesCorrectly verifies that the combined ServeHTTP method
+// routes WebSocket upgrades to HandleWebSocket and regular HTTP to HandleHTTPProxy.
+func TestServeHTTP_DispatchesCorrectly(t *testing.T) {
+	// Backend that serves both WS and HTTP
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+			conn, err := up.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			conn.WriteMessage(websocket.TextMessage, []byte("ws-ok"))
+			time.Sleep(50 * time.Millisecond)
+		} else {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("http-ok"))
+		}
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr(backendHost),
+			GatewayPort: backendPort,
+		}},
+	)
+
+	// Use ServeHTTP (the dispatcher) via a test server
+	proxyServer := httptest.NewServer(h)
+	defer proxyServer.Close()
+
+	// Test 1: Regular HTTP request → should get HTTP response from backend
+	httpReq, _ := http.NewRequest("GET", proxyServer.URL+"/vm/cust-1/ui/index.html", nil)
+	httpReq.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if string(bodyBytes) != "http-ok" {
+		t.Errorf("HTTP dispatch: got %q, want 'http-ok'", string(bodyBytes))
+	}
+
+	// Test 2: WebSocket upgrade → should connect
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/vm/cust-1/"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer valid-token")
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("WS dial failed: %v", err)
+	}
+	defer wsConn.Close()
+	_, msg, err := wsConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("WS read failed: %v", err)
+	}
+	if string(msg) != "ws-ok" {
+		t.Errorf("WS dispatch: got %q, want 'ws-ok'", string(msg))
 	}
 }
 

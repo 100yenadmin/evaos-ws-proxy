@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -404,6 +407,206 @@ func (h *Handler) forwardFrames(src, dst *websocket.Conn, direction string, logg
 		}
 	}
 }
+
+// isWebSocketUpgrade returns true if the request is a WebSocket upgrade.
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+// ServeHTTP dispatches between WebSocket upgrades and regular HTTP proxy requests.
+// Register this on the mux instead of HandleWebSocket directly.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isWebSocketUpgrade(r) {
+		h.HandleWebSocket(w, r)
+		return
+	}
+	h.HandleHTTPProxy(w, r)
+}
+
+// HandleHTTPProxy forwards regular HTTP requests to the backend VM gateway.
+// It performs the same auth + VM lookup as HandleWebSocket, then reverse-proxies
+// the request with the /vm/{customer_id} prefix stripped.
+func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
+	// Extract and validate customer_id from path
+	customerID := extractCustomerID(r.URL.Path)
+	if customerID == "" {
+		http.Error(w, "missing customer_id", http.StatusBadRequest)
+		return
+	}
+	if !customerIDPattern.MatchString(customerID) {
+		http.Error(w, "invalid customer_id", http.StatusBadRequest)
+		return
+	}
+
+	// Extract and validate Supabase JWT
+	tokenStr := extractToken(r)
+	if tokenStr == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	claims, err := h.jwt.Validate(tokenStr)
+	if err != nil {
+		slog.Info("http proxy auth failed",
+			"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	logger := slog.With(
+		"user_id", claims.UserID,
+		"customer_id", customerID,
+		"remote_addr", r.RemoteAddr,
+		"method", r.Method,
+		"path", r.URL.Path,
+	)
+
+	// Look up VM by customer_id
+	vm, err := h.vms.LookupByCustomerID(customerID)
+	if err != nil {
+		logger.Error("vm lookup failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if vm == nil {
+		http.Error(w, "no VM assigned", http.StatusNotFound)
+		return
+	}
+
+	// Authorization: verify the user owns this VM (unless admin)
+	if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+		logger.Warn("http proxy forbidden",
+			"vm_user_id", vm.UserID, "email", claims.Email)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Strip /vm/{customer_id} prefix from the path to get the backend path.
+	// e.g. /vm/cust-1/ui/index.html → /ui/index.html
+	backendPath := stripVMPrefix(r.URL.Path, customerID)
+
+	// Build backend target URL
+	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), vm.GatewayPort)
+	target, err := url.Parse(backendURL)
+	if err != nil {
+		logger.Error("invalid backend URL", "url", backendURL, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	logger.Debug("proxying HTTP request",
+		"backend", backendURL,
+		"backend_path", backendPath,
+	)
+
+	// Use httputil.ReverseProxy for robust proxying
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.URL.Path = backendPath
+			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
+			req.Host = target.Host
+
+			// Set trusted-proxy headers
+			req.Header.Set("X-Forwarded-User", customerID)
+			req.Header.Set("X-Forwarded-Customer", customerID)
+			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
+			req.Header.Set("X-Forwarded-Proto", "https")
+
+			// Inject gateway token if available
+			if token := vm.EffectiveToken(); token != "" {
+				req.Header.Set("X-OpenClaw-Token", token)
+			}
+
+			// Remove hop-by-hop headers
+			req.Header.Del("Authorization")
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// Add cache headers based on content type
+			addCacheHeaders(resp)
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Error("http proxy backend error", "error", err)
+			http.Error(w, "backend unavailable", http.StatusBadGateway)
+		},
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: h.connectTimeout,
+		},
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
+// stripVMPrefix removes the /vm/{customer_id} prefix from a URL path.
+// If path doesn't have the /vm/ prefix (Traefik strip mode), strips /{customer_id}.
+// Returns at least "/" if the result would be empty.
+func stripVMPrefix(urlPath, customerID string) string {
+	// Try /vm/{customer_id}/... first
+	prefix := "/vm/" + customerID
+	if strings.HasPrefix(urlPath, prefix) {
+		result := strings.TrimPrefix(urlPath, prefix)
+		if result == "" || result[0] != '/' {
+			result = "/" + result
+		}
+		return path.Clean(result)
+	}
+
+	// Try /{customer_id}/... (Traefik strip-prefix mode)
+	prefix = "/" + customerID
+	if strings.HasPrefix(urlPath, prefix) {
+		result := strings.TrimPrefix(urlPath, prefix)
+		if result == "" || result[0] != '/' {
+			result = "/" + result
+		}
+		return path.Clean(result)
+	}
+
+	return urlPath
+}
+
+// stripTokenParam removes the "token" query parameter from raw query string
+// to avoid leaking Supabase JWTs to the backend.
+func stripTokenParam(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+	values.Del("token")
+	return values.Encode()
+}
+
+// addCacheHeaders sets appropriate Cache-Control headers based on content type.
+// Static assets (JS, CSS, fonts, images) get long cache; HTML gets no-cache.
+func addCacheHeaders(resp *http.Response) {
+	ct := resp.Header.Get("Content-Type")
+
+	// Don't override if backend already set Cache-Control
+	if resp.Header.Get("Cache-Control") != "" {
+		return
+	}
+
+	switch {
+	case strings.Contains(ct, "text/html"):
+		resp.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	case strings.Contains(ct, "javascript"),
+		strings.Contains(ct, "text/css"),
+		strings.Contains(ct, "font/"),
+		strings.Contains(ct, "image/"):
+		resp.Header.Set("Cache-Control", "public, max-age=86400, immutable")
+	default:
+		// Other types: short cache
+		resp.Header.Set("Cache-Control", "public, max-age=300")
+	}
+}
+
+// Ensure Handler implements http.Handler (used for the combined WS+HTTP route).
+var _ http.Handler = (*Handler)(nil)
 
 // extractCustomerID extracts the customer_id from a path.
 // Supports both /vm/{customer_id}/... (direct) and /{customer_id}/... (after Traefik strip-prefix).
