@@ -852,7 +852,8 @@ func TestIsWebSocketUpgrade(t *testing.T) {
 
 func TestHandleHTTPProxy_NoToken(t *testing.T) {
 	h := newTestHandler(&mockJWT{}, &mockRegistry{})
-	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	// Non-UI path requires auth
+	req := httptest.NewRequest("GET", "/vm/cust-1/api/health", nil)
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 	if w.Code != http.StatusUnauthorized {
@@ -865,12 +866,28 @@ func TestHandleHTTPProxy_InvalidToken(t *testing.T) {
 		&mockJWT{err: fmt.Errorf("invalid token")},
 		&mockRegistry{},
 	)
-	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	// Non-UI path requires valid auth
+	req := httptest.NewRequest("GET", "/vm/cust-1/api/health", nil)
 	req.Header.Set("Authorization", "Bearer bad-token")
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_UIPathSkipsAuth(t *testing.T) {
+	// UI paths should not require JWT — VM lookup still needed
+	h := newTestHandler(
+		&mockJWT{}, // no valid claims
+		&mockRegistry{vm: nil}, // but no VM either
+	)
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+	// Should get 404 (no VM) instead of 401 (no auth) — proves auth was skipped
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 (no VM, auth skipped), got %d", w.Code)
 	}
 }
 
@@ -897,7 +914,8 @@ func TestHandleHTTPProxy_Forbidden(t *testing.T) {
 			TailnetIP:  strPtr("100.64.0.1"),
 		}},
 	)
-	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	// Non-UI path checks ownership
+	req := httptest.NewRequest("GET", "/vm/cust-1/api/health", nil)
 	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)

@@ -425,8 +425,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleHTTPProxy forwards regular HTTP requests to the backend VM gateway.
-// It performs the same auth + VM lookup as HandleWebSocket, then reverse-proxies
-// the request with the /vm/{customer_id} prefix stripped.
+// For /ui/ paths (static assets), auth is optional — the UI itself is not sensitive,
+// and the security boundary is the WebSocket connection (which requires a gateway token).
+// For other paths, Supabase JWT auth is required.
 func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	// Extract and validate customer_id from path
 	customerID := extractCustomerID(r.URL.Path)
@@ -439,30 +440,56 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract and validate Supabase JWT
-	tokenStr := extractToken(r)
-	if tokenStr == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
+	backendPath := stripVMPrefix(r.URL.Path, customerID)
+	isUIPath := strings.HasPrefix(backendPath, "/ui")
 
-	claims, err := h.jwt.Validate(tokenStr)
-	if err != nil {
-		slog.Info("http proxy auth failed",
-			"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+	var userID string
+
+	// UI static assets don't require JWT — the WS connection is the auth boundary.
+	// Other HTTP endpoints still require Supabase JWT auth.
+	if !isUIPath {
+		tokenStr := extractToken(r)
+		if tokenStr == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, err := h.jwt.Validate(tokenStr)
+		if err != nil {
+			slog.Info("http proxy auth failed",
+				"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		userID = claims.UserID
+
+		// Look up VM and verify ownership for non-UI paths
+		vm, err := h.vms.LookupByCustomerID(customerID)
+		if err != nil {
+			slog.Error("vm lookup failed", "error", err, "customer_id", customerID)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if vm == nil {
+			http.Error(w, "no VM assigned", http.StatusNotFound)
+			return
+		}
+		if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+			slog.Warn("http proxy forbidden",
+				"vm_user_id", vm.UserID, "email", claims.Email, "customer_id", customerID)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	logger := slog.With(
-		"user_id", claims.UserID,
+		"user_id", userID,
 		"customer_id", customerID,
 		"remote_addr", r.RemoteAddr,
 		"method", r.Method,
 		"path", r.URL.Path,
 	)
 
-	// Look up VM by customer_id
+	// Look up VM by customer_id (for UI paths, we still need the IP)
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
 		logger.Error("vm lookup failed", "error", err)
@@ -473,18 +500,6 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no VM assigned", http.StatusNotFound)
 		return
 	}
-
-	// Authorization: verify the user owns this VM (unless admin)
-	if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
-		logger.Warn("http proxy forbidden",
-			"vm_user_id", vm.UserID, "email", claims.Email)
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	// Strip /vm/{customer_id} prefix from the path to get the backend path.
-	// e.g. /vm/cust-1/ui/index.html → /ui/index.html
-	backendPath := stripVMPrefix(r.URL.Path, customerID)
 
 	// Build backend target URL
 	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), vm.GatewayPort)
