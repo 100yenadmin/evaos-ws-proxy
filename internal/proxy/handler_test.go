@@ -788,7 +788,7 @@ func TestStripVMPrefix(t *testing.T) {
 		expected   string
 	}{
 		{"/vm/cust-1/ui/index.html", "cust-1", "/ui/index.html"},
-		{"/vm/cust-1/ui/", "cust-1", "/ui"},
+		{"/vm/cust-1/ui/", "cust-1", "/ui/"},
 		{"/vm/cust-1/ui/assets/style.css", "cust-1", "/ui/assets/style.css"},
 		{"/vm/cust-1/", "cust-1", "/"},
 		{"/vm/cust-1", "cust-1", "/"},

@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"path"
+
 	"regexp"
 	"strings"
 	"sync"
@@ -575,7 +575,7 @@ func stripVMPrefix(urlPath, customerID string) string {
 		if result == "" || result[0] != '/' {
 			result = "/" + result
 		}
-		return path.Clean(result)
+		return result
 	}
 
 	// Try /{customer_id}/... (Traefik strip-prefix mode)
@@ -585,7 +585,7 @@ func stripVMPrefix(urlPath, customerID string) string {
 		if result == "" || result[0] != '/' {
 			result = "/" + result
 		}
-		return path.Clean(result)
+		return result
 	}
 
 	return urlPath
