@@ -27,7 +27,8 @@ var customerIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 var allowedOrigins = map[string]bool{
 	"https://electricsheephq.com":     true,
 	"https://www.electricsheephq.com": true,
-	"http://localhost:5173":           true, // Vite dev
+	"https://ecs.electricsheephq.com": true, // Native UI served via proxy
+	"http://localhost:5173":           true,  // Vite dev
 	"http://localhost:3000":           true,
 }
 
