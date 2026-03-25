@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -501,6 +502,271 @@ func TestConnectBackend_RetryOnFailure(t *testing.T) {
 	mu.Unlock()
 	if finalCount < 3 {
 		t.Errorf("expected at least 3 dial attempts, got %d", finalCount)
+	}
+}
+
+// --- Connect frame token injection tests ---
+
+// TestConnectFrameTokenInjection verifies that when a gateway token is present,
+// the proxy injects auth.token into the first (connect) frame from client→backend,
+// while passing subsequent frames through unmodified.
+func TestConnectFrameTokenInjection(t *testing.T) {
+	type receivedMsg struct {
+		index int
+		body  string
+	}
+
+	backendMsgs := make(chan receivedMsg, 10)
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			t.Logf("backend upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		for i := 0; ; i++ {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			backendMsgs <- receivedMsg{index: i, body: string(msg)}
+		}
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	gatewayToken := "gw-inject-test-token"
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr(backendHost),
+			GatewayPort:  backendPort,
+			GatewayToken: strPtr(gatewayToken),
+		}},
+	)
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(h.HandleWebSocket))
+	defer proxyServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/vm/cust-1/"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer valid-token")
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("client dial error: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Send connect frame (first message) — no auth field yet
+	connectFrame := `{"type":"connect","session_id":"abc123"}`
+	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(connectFrame)); err != nil {
+		t.Fatalf("client write connect frame error: %v", err)
+	}
+
+	// Wait for backend to receive the (modified) connect frame
+	var first receivedMsg
+	select {
+	case first = <-backendMsgs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for connect frame at backend")
+	}
+
+	// Verify token was injected
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(first.body), &parsed); err != nil {
+		t.Fatalf("backend received non-JSON: %s", first.body)
+	}
+	authObj, ok := parsed["auth"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("connect frame missing 'auth' object, got: %s", first.body)
+	}
+	if got := authObj["token"]; got != gatewayToken {
+		t.Errorf("auth.token = %q, want %q", got, gatewayToken)
+	}
+	// Preserve all original fields
+	if got := parsed["type"]; got != "connect" {
+		t.Errorf("type = %q, want 'connect'", got)
+	}
+	if got := parsed["session_id"]; got != "abc123" {
+		t.Errorf("session_id = %q, want 'abc123'", got)
+	}
+
+	// Send a second frame — should pass through unmodified
+	secondMsg := `{"type":"ping"}`
+	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(secondMsg)); err != nil {
+		t.Fatalf("client write second frame error: %v", err)
+	}
+
+	var second receivedMsg
+	select {
+	case second = <-backendMsgs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for second frame at backend")
+	}
+	if second.body != secondMsg {
+		t.Errorf("second frame = %q, want %q (should be unmodified)", second.body, secondMsg)
+	}
+}
+
+// TestConnectFrameTokenInjection_ExistingAuth verifies that if the client already
+// sends an auth object, the proxy overwrites auth.token with the gateway token
+// while preserving other auth fields.
+func TestConnectFrameTokenInjection_ExistingAuth(t *testing.T) {
+	backendMsgs := make(chan string, 1)
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		backendMsgs <- string(msg)
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	gatewayToken := "real-gw-token"
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr(backendHost),
+			GatewayPort:  backendPort,
+			GatewayToken: strPtr(gatewayToken),
+		}},
+	)
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(h.HandleWebSocket))
+	defer proxyServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/vm/cust-1/"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer valid-token")
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("client dial error: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Send connect frame with an existing (wrong) token and extra auth fields
+	connectFrame := `{"type":"connect","auth":{"token":"client-wrong-token","extra":"keep-me"}}`
+	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(connectFrame)); err != nil {
+		t.Fatalf("client write error: %v", err)
+	}
+
+	var received string
+	select {
+	case received = <-backendMsgs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for message at backend")
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(received), &parsed); err != nil {
+		t.Fatalf("non-JSON at backend: %s", received)
+	}
+	authObj, ok := parsed["auth"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing auth object, got: %s", received)
+	}
+	if got := authObj["token"]; got != gatewayToken {
+		t.Errorf("auth.token = %q, want %q (gateway token should override)", got, gatewayToken)
+	}
+	// Other auth fields preserved
+	if got := authObj["extra"]; got != "keep-me" {
+		t.Errorf("auth.extra = %q, want 'keep-me'", got)
+	}
+}
+
+// TestConnectFrameTokenInjection_NoToken verifies that when no gateway token is set,
+// the first frame passes through completely unmodified.
+func TestConnectFrameTokenInjection_NoToken(t *testing.T) {
+	backendMsgs := make(chan string, 1)
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		backendMsgs <- string(msg)
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr(backendHost),
+			GatewayPort:  backendPort,
+			GatewayToken: nil, // no token
+		}},
+	)
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(h.HandleWebSocket))
+	defer proxyServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxyServer.URL, "http") + "/vm/cust-1/"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer valid-token")
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("client dial error: %v", err)
+	}
+	defer clientConn.Close()
+
+	originalMsg := `{"type":"connect","session_id":"xyz"}`
+	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(originalMsg)); err != nil {
+		t.Fatalf("client write error: %v", err)
+	}
+
+	var received string
+	select {
+	case received = <-backendMsgs:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for message at backend")
+	}
+
+	if received != originalMsg {
+		t.Errorf("got %q, want %q (no-token path should not modify frame)", received, originalMsg)
 	}
 }
 

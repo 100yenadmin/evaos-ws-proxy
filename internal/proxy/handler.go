@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -313,6 +314,14 @@ func (h *Handler) proxyBidirectional(client, backend *websocket.Conn, vm *regist
 	// Client → Backend
 	go func() {
 		defer closeDone()
+		// If we have a gateway token, intercept the first client message (connect frame)
+		// and inject auth.token before forwarding. All subsequent frames pass through as-is.
+		if token := vm.EffectiveToken(); token != "" {
+			if err := h.injectTokenInConnectFrame(client, backend, token, logger); err != nil {
+				logger.Warn("connect frame injection failed", "error", err)
+				return
+			}
+		}
 		h.forwardFrames(client, backend, "client→backend", logger)
 	}()
 
@@ -329,6 +338,48 @@ func (h *Handler) proxyBidirectional(client, backend *websocket.Conn, vm *regist
 	closeMsg := websocket.FormatCloseMessage(websocket.CloseGoingAway, "peer disconnected")
 	client.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(time.Second))
 	backend.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(time.Second))
+}
+
+// injectTokenInConnectFrame reads the first message from the client, injects the
+// gateway token into the auth.token field, and sends the modified frame to the backend.
+// If the message is not valid JSON, it is forwarded unmodified.
+func (h *Handler) injectTokenInConnectFrame(client, backend *websocket.Conn, token string, logger *slog.Logger) error {
+	msgType, msg, err := client.ReadMessage()
+	if err != nil {
+		if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+			logger.Warn("read error", "direction", "client→backend (connect frame)", "error", err)
+		}
+		return err
+	}
+
+	// Only attempt JSON injection for text frames
+	if msgType == websocket.TextMessage {
+		var frame map[string]interface{}
+		if jsonErr := json.Unmarshal(msg, &frame); jsonErr == nil {
+			// Create auth object if missing, then set token
+			authObj, ok := frame["auth"].(map[string]interface{})
+			if !ok {
+				authObj = make(map[string]interface{})
+			}
+			authObj["token"] = token
+			frame["auth"] = authObj
+
+			if modified, marshalErr := json.Marshal(frame); marshalErr == nil {
+				msg = modified
+				logger.Debug("injected gateway token into connect frame")
+			} else {
+				logger.Warn("failed to marshal modified connect frame, forwarding original", "error", marshalErr)
+			}
+		} else {
+			logger.Debug("connect frame is not valid JSON, forwarding unmodified")
+		}
+	}
+
+	if err := backend.WriteMessage(msgType, msg); err != nil {
+		logger.Warn("write error", "direction", "client→backend (connect frame)", "error", err)
+		return err
+	}
+	return nil
 }
 
 func (h *Handler) forwardFrames(src, dst *websocket.Conn, direction string, logger *slog.Logger) {
