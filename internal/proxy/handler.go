@@ -147,27 +147,41 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract and validate Supabase JWT
-	tokenStr := extractToken(r)
-	if tokenStr == "" {
-		slog.Info("auth failed: no token provided",
-			"remote_addr", r.RemoteAddr, "customer_id", customerID)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+	// Determine if this is a native UI WS connection (path contains /ui).
+	// Native UI connections authenticate with the gateway token directly —
+	// the proxy just passes through and the gateway handles auth.
+	backendPathWS := stripVMPrefix(r.URL.Path, customerID)
+	isUIWS := strings.HasPrefix(backendPathWS, "/ui")
+
+	var claims *auth.Claims
+	if !isUIWS {
+		// Non-UI WS: require Supabase JWT (dashboard/API connections)
+		tokenStr := extractToken(r)
+		if tokenStr == "" {
+			slog.Info("auth failed: no token provided",
+				"remote_addr", r.RemoteAddr, "customer_id", customerID)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		var err error
+		claims, err = h.jwt.Validate(tokenStr)
+		if err != nil {
+			slog.Info("auth failed: invalid token",
+				"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 
-	claims, err := h.jwt.Validate(tokenStr)
-	if err != nil {
-		slog.Info("auth failed: invalid token",
-			"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+	// Check per-user connection limit (use customer_id for UI WS connections)
+	connTrackID := customerID
+	if claims != nil {
+		connTrackID = claims.UserID
 	}
-
-	// Check per-user connection limit
-	if !h.acquireUserConn(claims.UserID) {
+	if !h.acquireUserConn(connTrackID) {
 		slog.Warn("per-user connection limit reached",
-			"user_id", claims.UserID, "max_per_user", h.maxPerUser)
+			"conn_track_id", connTrackID, "max_per_user", h.maxPerUser)
 		http.Error(w, "too many connections for user", http.StatusServiceUnavailable)
 		return
 	}
@@ -176,12 +190,19 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	userConnAcquired := true
 	defer func() {
 		if userConnAcquired {
-			h.releaseUserConn(claims.UserID)
+			h.releaseUserConn(connTrackID)
 		}
 	}()
 
+	userID := ""
+	userEmail := ""
+	if claims != nil {
+		userID = claims.UserID
+		userEmail = claims.Email
+	}
+
 	logger := slog.With(
-		"user_id", claims.UserID,
+		"user_id", userID,
 		"customer_id", customerID,
 		"remote_addr", r.RemoteAddr,
 	)
@@ -199,12 +220,15 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorization: verify the user owns this VM (unless admin)
-	if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
-		logger.Warn("user does not own this VM",
-			"vm_user_id", vm.UserID, "email", claims.Email)
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
+	// Authorization: for non-UI WS, verify the user owns this VM (unless admin)
+	// UI WS connections are authenticated by the gateway via gateway token
+	if claims != nil {
+		if vm.UserID != claims.UserID && !h.isAdmin(userEmail) {
+			logger.Warn("user does not own this VM",
+				"vm_user_id", vm.UserID, "email", userEmail)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	logger = logger.With("ip", vm.EffectiveIP(), "gateway_port", vm.GatewayPort)
