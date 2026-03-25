@@ -356,13 +356,19 @@ func (h *Handler) injectTokenInConnectFrame(client, backend *websocket.Conn, tok
 	if msgType == websocket.TextMessage {
 		var frame map[string]interface{}
 		if jsonErr := json.Unmarshal(msg, &frame); jsonErr == nil {
-			// Create auth object if missing, then set token
-			authObj, ok := frame["auth"].(map[string]interface{})
+			// OpenClaw connect frame format: {"type":"req","method":"connect","id":"...","params":{"auth":{"token":"..."},...}}
+			// Inject token into params.auth.token (not top-level auth)
+			params, hasParams := frame["params"].(map[string]interface{})
+			if !hasParams {
+				params = make(map[string]interface{})
+			}
+			authObj, ok := params["auth"].(map[string]interface{})
 			if !ok {
 				authObj = make(map[string]interface{})
 			}
 			authObj["token"] = token
-			frame["auth"] = authObj
+			params["auth"] = authObj
+			frame["params"] = params
 
 			if modified, marshalErr := json.Marshal(frame); marshalErr == nil {
 				msg = modified

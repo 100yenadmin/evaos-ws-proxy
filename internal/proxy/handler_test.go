@@ -570,7 +570,7 @@ func TestConnectFrameTokenInjection(t *testing.T) {
 	defer clientConn.Close()
 
 	// Send connect frame (first message) — no auth field yet
-	connectFrame := `{"type":"connect","session_id":"abc123"}`
+	connectFrame := `{"type":"req","method":"connect","id":"1","params":{"session_id":"abc123"}}`
 	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(connectFrame)); err != nil {
 		t.Fatalf("client write connect frame error: %v", err)
 	}
@@ -588,19 +588,23 @@ func TestConnectFrameTokenInjection(t *testing.T) {
 	if err := json.Unmarshal([]byte(first.body), &parsed); err != nil {
 		t.Fatalf("backend received non-JSON: %s", first.body)
 	}
-	authObj, ok := parsed["auth"].(map[string]interface{})
+	params, ok := parsed["params"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("connect frame missing 'auth' object, got: %s", first.body)
+		t.Fatalf("connect frame missing 'params' object, got: %s", first.body)
+	}
+	authObj, ok := params["auth"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("connect frame missing 'params.auth' object, got: %s", first.body)
 	}
 	if got := authObj["token"]; got != gatewayToken {
-		t.Errorf("auth.token = %q, want %q", got, gatewayToken)
+		t.Errorf("params.auth.token = %q, want %q", got, gatewayToken)
 	}
 	// Preserve all original fields
-	if got := parsed["type"]; got != "connect" {
-		t.Errorf("type = %q, want 'connect'", got)
+	if got := parsed["type"]; got != "req" {
+		t.Errorf("type = %q, want 'req'", got)
 	}
-	if got := parsed["session_id"]; got != "abc123" {
-		t.Errorf("session_id = %q, want 'abc123'", got)
+	if got := params["session_id"]; got != "abc123" {
+		t.Errorf("params.session_id = %q, want 'abc123'", got)
 	}
 
 	// Send a second frame — should pass through unmodified
@@ -674,7 +678,7 @@ func TestConnectFrameTokenInjection_ExistingAuth(t *testing.T) {
 	defer clientConn.Close()
 
 	// Send connect frame with an existing (wrong) token and extra auth fields
-	connectFrame := `{"type":"connect","auth":{"token":"client-wrong-token","extra":"keep-me"}}`
+	connectFrame := `{"type":"req","method":"connect","id":"1","params":{"auth":{"token":"client-wrong-token","extra":"keep-me"}}}`
 	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(connectFrame)); err != nil {
 		t.Fatalf("client write error: %v", err)
 	}
@@ -690,16 +694,20 @@ func TestConnectFrameTokenInjection_ExistingAuth(t *testing.T) {
 	if err := json.Unmarshal([]byte(received), &parsed); err != nil {
 		t.Fatalf("non-JSON at backend: %s", received)
 	}
-	authObj, ok := parsed["auth"].(map[string]interface{})
+	params, ok := parsed["params"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("missing auth object, got: %s", received)
+		t.Fatalf("missing params object, got: %s", received)
+	}
+	authObj, ok := params["auth"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing params.auth object, got: %s", received)
 	}
 	if got := authObj["token"]; got != gatewayToken {
-		t.Errorf("auth.token = %q, want %q (gateway token should override)", got, gatewayToken)
+		t.Errorf("params.auth.token = %q, want %q (gateway token should override)", got, gatewayToken)
 	}
 	// Other auth fields preserved
 	if got := authObj["extra"]; got != "keep-me" {
-		t.Errorf("auth.extra = %q, want 'keep-me'", got)
+		t.Errorf("params.auth.extra = %q, want 'keep-me'", got)
 	}
 }
 
@@ -753,7 +761,7 @@ func TestConnectFrameTokenInjection_NoToken(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	originalMsg := `{"type":"connect","session_id":"xyz"}`
+	originalMsg := `{"type":"req","method":"connect","id":"1","params":{"session_id":"xyz"}}`
 	if err := clientConn.WriteMessage(websocket.TextMessage, []byte(originalMsg)); err != nil {
 		t.Fatalf("client write error: %v", err)
 	}
