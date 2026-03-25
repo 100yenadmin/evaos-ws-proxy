@@ -541,6 +541,15 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		ModifyResponse: func(resp *http.Response) error {
 			// Add cache headers based on content type
 			addCacheHeaders(resp)
+
+			// Rewrite Location headers to preserve /vm/{customer_id} prefix.
+			// The backend returns paths like /ui/ but the browser needs /vm/golden/ui/.
+			if loc := resp.Header.Get("Location"); loc != "" {
+				if strings.HasPrefix(loc, "/") {
+					resp.Header.Set("Location", "/vm/"+customerID+loc)
+				}
+			}
+
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
