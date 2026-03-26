@@ -24,11 +24,12 @@ const (
 
 // maintenanceData is the template data for the maintenance page.
 type maintenanceData struct {
-	CustomerID string
-	Reason     ErrorReason
-	Title      string
-	Message    string
-	ShowRestart bool
+	CustomerID     string
+	Reason         ErrorReason
+	Title          string
+	Message        string
+	ShowRestart    bool
+	DiagnosticsURL string
 }
 
 // serveMaintenancePage renders the maintenance page for the given error scenario.
@@ -43,8 +44,9 @@ func (h *Handler) serveMaintenancePage(w http.ResponseWriter, customerID string,
 	switch reason {
 	case ReasonBackendDown:
 		data.Title = "Your Eva is temporarily offline"
-		data.Message = "The gateway process appears to have stopped. Please log in to the diagnostics page to restart."
+		data.Message = "The gateway process appears to have stopped. Use the diagnostics page to check status and restart."
 		data.ShowRestart = false // M-5: no restart button on unauthenticated page
+		data.DiagnosticsURL = fmt.Sprintf("/vm/%s/repairbot", customerID)
 	case ReasonNotProvisioned:
 		data.Title = "Your Eva is being set up"
 		data.Message = "Your instance is being provisioned. This usually takes a few minutes."
@@ -57,6 +59,7 @@ func (h *Handler) serveMaintenancePage(w http.ResponseWriter, customerID string,
 		data.Title = "Connection issue"
 		data.Message = "Unable to reach your instance. This may be a temporary network issue."
 		data.ShowRestart = false // M-5: no restart button on unauthenticated page
+		data.DiagnosticsURL = fmt.Sprintf("/vm/%s/repairbot", customerID)
 	default:
 		data.Title = "Something went wrong"
 		data.Message = "An unexpected error occurred."
@@ -304,7 +307,12 @@ footer{
     <div id="countdown" class="countdown"></div>
     {{end}}
 
-    <div style="margin-top:20px">
+    <div style="margin-top:20px;display:flex;flex-direction:column;gap:10px;align-items:center">
+      {{if .DiagnosticsURL}}
+      <a href="{{.DiagnosticsURL}}" class="btn" style="text-decoration:none">
+        🔧 Open Diagnostics
+      </a>
+      {{end}}
       <a href="mailto:androiddreams@electricsheephq.com?subject=evaOS%20Support%20-%20{{.CustomerID}}" class="btn-secondary">
         Contact Support
       </a>
