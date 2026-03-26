@@ -110,12 +110,7 @@ func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
 	var backendPort int
 	fmt.Sscanf(parts[1], "%d", &backendPort)
 
-	// We need to override the fileServerPort constant for testing.
-	// Since we can't do that easily, we'll test via ServeHTTP with a VM
-	// whose EffectiveIP points to our test server. The actual port won't
-	// match 8899, but we can test the handler integration via the full
-	// E2E path by using a test server that listens on the expected port.
-	// For unit testing, we test auth and routing separately.
+	// The file proxy uses vm.GatewayPort, so our mock VM points to the test server.
 
 	// Test: verify the handler calls through correctly with session auth
 	secret := "test-file-secret"
@@ -141,15 +136,16 @@ func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 
-	// The file proxy will try to connect to fileServerPort (8899) not our test port.
-	// So for the actual forwarding test, we need a full integration test.
-	// Here we just verify auth + routing works.
 	h.HandleFileProxy(w, req)
 
-	// Since the file server port (8899) doesn't match our test server,
-	// this will fail with 502. That's expected — the auth worked.
-	// A proper integration test would need port matching.
-	_ = receivedPath
+	// Verify the request was forwarded to our mock server with correct path
+	if receivedPath != "/files/reports/q1.pdf" {
+		t.Errorf("expected backend path /files/reports/q1.pdf, got %s", receivedPath)
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	// Verify gateway token was injected (EffectiveToken returns "" for test VMInfo without GatewayToken)
 	_ = receivedHeaders
 }
 

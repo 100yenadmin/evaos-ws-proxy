@@ -10,15 +10,15 @@ import (
 	"strings"
 )
 
-const fileServerPort = 8890
-
 // maxFileBodySize limits file uploads through the proxy to 100MB.
 const maxFileBodySize = 100 << 20 // 100 MiB
 
-// HandleFileProxy serves files from a customer's VM file server (port 8890).
+// HandleFileProxy serves files from a customer's VM gateway file-browser plugin.
 // Route: /vm/{customer_id}/files/{path...}
 // Auth: Supabase JWT or session cookie (same as other authenticated routes).
 // The /vm/{customer_id}/files prefix is stripped before proxying.
+// Requests are forwarded to the VM's gateway port (vm.GatewayPort) where the
+// file-browser plugin is registered at /files with auth: "gateway".
 func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	// File Browser uses GET, HEAD, POST, PUT, PATCH, DELETE for its full UI.
 	// Allow all standard methods.
@@ -132,7 +132,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// --- Reverse proxy to VM file server ---
-	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), fileServerPort)
+	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), vm.GatewayPort)
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		logger.Error("invalid file server URL", "url", backendURL, "error", err)
@@ -150,9 +150,22 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
 			req.Host = target.Host
 
-			// Clean up headers — don't forward auth to the file server
+			// Set trusted-proxy headers
+			req.Header.Set("X-Forwarded-User", customerID)
+			req.Header.Set("X-Forwarded-Customer", customerID)
+			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
+			req.Header.Set("X-Forwarded-Proto", "https")
+
+			// Remove browser auth headers first
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
+
+			// Inject gateway token as Authorization: Bearer for the file-browser
+			// plugin (auth: "gateway"). The gateway validates Bearer tokens for
+			// HTTP routes with auth: "gateway".
+			if token := vm.EffectiveToken(); token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// Set CORS headers for file downloads
