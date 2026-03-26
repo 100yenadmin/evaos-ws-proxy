@@ -69,13 +69,24 @@ func TestHandleFileProxy_Forbidden(t *testing.T) {
 	}
 }
 
-func TestHandleFileProxy_MethodNotAllowed(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{})
-	req := httptest.NewRequest("POST", "/vm/cust-1/files/report.pdf", nil)
+func TestHandleFileProxy_PostAllowed(t *testing.T) {
+	// File Browser needs POST/PUT/DELETE for file management
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999,
+		}},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-1/files/api/resources", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleFileProxy(w, req)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", w.Code)
+	// Should pass auth (502 expected because no file server)
+	if w.Code == http.StatusMethodNotAllowed {
+		t.Error("POST should be allowed for file proxy (File Browser needs it)")
 	}
 }
 

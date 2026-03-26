@@ -534,6 +534,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case strings.HasPrefix(backendPath, "/files"):
 			h.HandleFileProxy(w, r)
 			return
+		case strings.HasPrefix(backendPath, "/v1/audio/"):
+			h.HandleAudioProxy(w, r)
+			return
 		}
 	}
 

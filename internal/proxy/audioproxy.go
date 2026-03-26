@@ -6,18 +6,24 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 )
 
-const fileServerPort = 8890
+const speachesPort = 8000
 
-// HandleFileProxy serves files from a customer's VM file server (port 8890).
-// Route: /vm/{customer_id}/files/{path...}
+// HandleAudioProxy proxies OpenAI-compatible audio API requests to Speaches on the VM.
+// Route: /vm/{customer_id}/v1/audio/{endpoint}
+// Supported endpoints:
+//   - POST /v1/audio/transcriptions (STT — multipart/form-data with audio file)
+//   - POST /v1/audio/speech (TTS — JSON body, returns audio bytes)
+//
 // Auth: Supabase JWT or session cookie (same as other authenticated routes).
-// The /vm/{customer_id}/files prefix is stripped before proxying.
-func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
-	// File Browser uses GET, HEAD, POST, PUT, PATCH, DELETE for its full UI.
-	// Allow all standard methods.
+// The /vm/{customer_id} prefix is stripped; /v1/audio/* is kept intact.
+func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
+	// Allow POST (main usage) and OPTIONS (CORS preflight)
+	if r.Method != http.MethodPost && r.Method != http.MethodOptions {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
@@ -25,7 +31,20 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Auth (identical to HandleHTTPProxy non-UI path) ---
+	// Handle CORS preflight
+	if r.Method == http.MethodOptions {
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "3600")
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// --- Auth (identical to file proxy) ---
 	var userID string
 	var authedViaSession bool
 
@@ -62,7 +81,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		claims, err := h.jwt.Validate(tokenStr)
 		if err != nil {
-			slog.Info("file proxy auth failed",
+			slog.Info("audio proxy auth failed",
 				"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -72,7 +91,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		// Verify ownership
 		vm, err := h.vms.LookupByCustomerID(customerID)
 		if err != nil {
-			slog.Error("file proxy vm lookup failed", "error", err, "customer_id", customerID)
+			slog.Error("audio proxy vm lookup failed", "error", err, "customer_id", customerID)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
@@ -89,7 +108,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	// --- VM lookup ---
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
-		slog.Error("file proxy vm lookup failed", "error", err, "customer_id", customerID)
+		slog.Error("audio proxy vm lookup failed", "error", err, "customer_id", customerID)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -98,70 +117,54 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Build file path ---
-	// Strip /vm/{customer_id} prefix, keep /files/* intact.
-	// File Browser is configured with baseurl=/files, so it expects /files/... paths.
+	// --- Build backend path ---
+	// Strip /vm/{customer_id}, keep /v1/audio/* intact
 	backendPath := stripVMPrefix(r.URL.Path, customerID)
-	// backendPath is now "/files/..." — pass it through as-is.
-	filePath := backendPath
-	if filePath == "" {
-		filePath = "/files/"
-	}
 
 	logger := slog.With(
 		"user_id", userID,
 		"customer_id", customerID,
 		"remote_addr", r.RemoteAddr,
-		"file_path", filePath,
+		"audio_path", backendPath,
 	)
 
-	// --- Reverse proxy to VM file server ---
-	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), fileServerPort)
+	// --- Reverse proxy to Speaches on VM ---
+	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), speachesPort)
 	target, err := url.Parse(backendURL)
 	if err != nil {
-		logger.Error("invalid file server URL", "url", backendURL, "error", err)
+		logger.Error("invalid speaches URL", "url", backendURL, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	logger.Debug("proxying file request", "backend", backendURL, "file_path", filePath)
+	logger.Debug("proxying audio request", "backend", backendURL, "path", backendPath)
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-			req.URL.Path = filePath
+			req.URL.Path = backendPath
 			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
 			req.Host = target.Host
 
-			// Clean up headers — don't forward auth to the file server
+			// Don't forward auth headers to the backend
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// Set CORS headers for file downloads
+			// Set CORS headers
 			origin := r.Header.Get("Origin")
 			if origin != "" && allowedOrigins[origin] {
 				resp.Header.Set("Access-Control-Allow-Origin", origin)
 			}
-
-			// Force download for non-HTML content
-			ct := resp.Header.Get("Content-Type")
-			if !strings.Contains(ct, "text/html") && resp.Header.Get("Content-Disposition") == "" {
-				// Let the browser decide — don't force download for images/PDFs
-			}
-
-			// Cache shared files for 5 minutes
-			if resp.Header.Get("Cache-Control") == "" {
-				resp.Header.Set("Cache-Control", "private, max-age=300")
-			}
-
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logger.Error("file proxy backend error", "error", err)
-			http.Error(w, "file server unavailable", http.StatusBadGateway)
+			logger.Error("audio proxy backend error", "error", err)
+			http.Error(w, "audio service unavailable", http.StatusBadGateway)
 		},
+		// No FlushInterval needed — audio responses are typically complete before sending.
+		// For streaming TTS, we'd add FlushInterval: -1, but Speaches buffers.
 		Transport: &http.Transport{
 			ResponseHeaderTimeout: h.connectTimeout,
 		},
