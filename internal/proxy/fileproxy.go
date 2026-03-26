@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -37,6 +38,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	// --- Auth (identical to HandleHTTPProxy non-UI path) ---
 	var userID string
 	var authedViaSession bool
+	var authedViaGatewayToken bool
 
 	// 1. Check session cookie
 	if h.sessions != nil {
@@ -62,8 +64,35 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Fall back to JWT
+	// 2. Check gateway token cookie (evaos_gw_token)
+	// This cookie is set by HandleAuthCallback and scoped to /vm/{customer_id}/.
+	// It proves the user completed the Supabase auth flow for this VM.
 	if !authedViaSession {
+		if gwCookie, err := r.Cookie("evaos_gw_token"); err == nil && gwCookie.Value != "" {
+			vm, err := h.vms.LookupByCustomerID(customerID)
+			if err == nil && vm != nil {
+				expectedToken := vm.EffectiveToken()
+				if expectedToken != "" && subtle.ConstantTimeCompare([]byte(gwCookie.Value), []byte(expectedToken)) == 1 {
+					userID = "gateway:" + customerID
+					authedViaGatewayToken = true
+				}
+			}
+		}
+	}
+
+	if authedViaGatewayToken {
+		slog.Debug("file proxy: authenticated via gateway token",
+			"customer_id", customerID, "remote_addr", r.RemoteAddr)
+	}
+
+	// Read-only restriction for gateway token auth
+	if authedViaGatewayToken && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+		http.Error(w, "gateway token auth is read-only for file operations", http.StatusForbidden)
+		return
+	}
+
+	// 3. Fall back to JWT
+	if !authedViaSession && !authedViaGatewayToken {
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

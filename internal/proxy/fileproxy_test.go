@@ -290,6 +290,106 @@ func TestHandleFileProxy_PathTraversal(t *testing.T) {
 	}
 }
 
+// --- Gateway Token Cookie Auth Tests ---
+
+func TestHandleFileProxy_GatewayTokenCookieAuth(t *testing.T) {
+	gwToken := "gw-secret-token-abc123"
+	h := newTestHandler(
+		&mockJWT{}, // no JWT configured — would fail if it fell through
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayPort:  59999,
+			GatewayToken: &gwToken,
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/files/test.txt", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_gw_token", Value: gwToken})
+	w := httptest.NewRecorder()
+	h.HandleFileProxy(w, req)
+
+	// Should pass auth (502 expected because no file server, but NOT 401/403)
+	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+		t.Errorf("gateway token cookie auth should pass, got %d", w.Code)
+	}
+}
+
+func TestHandleFileProxy_GatewayTokenMismatch(t *testing.T) {
+	gwToken := "correct-token"
+	h := newTestHandler(
+		&mockJWT{err: fmt.Errorf("no valid JWT")},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayPort:  59999,
+			GatewayToken: &gwToken,
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/files/test.txt", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_gw_token", Value: "wrong-token"})
+	w := httptest.NewRecorder()
+	h.HandleFileProxy(w, req)
+
+	// Mismatched gateway token should fall through to JWT, which also fails → 401
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("gateway token mismatch should fall through to JWT → 401, got %d", w.Code)
+	}
+}
+
+func TestHandleFileProxy_GatewayTokenNoTokenOnVM(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{err: fmt.Errorf("no valid JWT")},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayPort:  59999,
+			GatewayToken: nil, // no gateway token set on VM
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/files/test.txt", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_gw_token", Value: "some-token"})
+	w := httptest.NewRecorder()
+	h.HandleFileProxy(w, req)
+
+	// VM has no token → gateway auth skipped → falls through to JWT → 401
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("gateway token on VM with no token should fall through → 401, got %d", w.Code)
+	}
+}
+
+func TestHandleFileProxy_GatewayTokenReadOnly(t *testing.T) {
+	gwToken := "gw-secret-token-abc123"
+	h := newTestHandler(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayPort:  59999,
+			GatewayToken: &gwToken,
+		}},
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/files/api/resources", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_gw_token", Value: gwToken})
+	w := httptest.NewRecorder()
+	h.HandleFileProxy(w, req)
+
+	// POST with gateway token auth should be rejected as read-only
+	if w.Code != http.StatusForbidden {
+		t.Errorf("gateway token POST should be forbidden (read-only), got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "read-only") {
+		t.Errorf("expected read-only error message, got %q", w.Body.String())
+	}
+}
+
 func TestHandleFileProxy_HeadMethod(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
