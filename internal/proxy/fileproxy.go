@@ -86,9 +86,13 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read-only restriction for gateway token auth
+	// Allow POST to /api/login (File Browser session) but block other mutations
 	if authedViaGatewayToken && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-		http.Error(w, "gateway token auth is read-only for file operations", http.StatusForbidden)
-		return
+		backendPathCheck := stripVMPrefix(r.URL.Path, customerID)
+		if !strings.HasSuffix(backendPathCheck, "/api/login") {
+			http.Error(w, "gateway token auth is read-only for file operations", http.StatusForbidden)
+			return
+		}
 	}
 
 	// 3. Fall back to JWT
