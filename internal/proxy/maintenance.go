@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -31,6 +32,8 @@ type maintenanceData struct {
 }
 
 // serveMaintenancePage renders the maintenance page for the given error scenario.
+// M-5: Removed restart button — users should use /repairbot (authenticated) for self-service restart.
+// M-6: Renders template to buffer first, then writes to avoid partial response on error.
 func (h *Handler) serveMaintenancePage(w http.ResponseWriter, customerID string, reason ErrorReason) {
 	data := maintenanceData{
 		CustomerID: customerID,
@@ -40,8 +43,8 @@ func (h *Handler) serveMaintenancePage(w http.ResponseWriter, customerID string,
 	switch reason {
 	case ReasonBackendDown:
 		data.Title = "Your Eva is temporarily offline"
-		data.Message = "The gateway process appears to have stopped. You can try restarting it."
-		data.ShowRestart = true
+		data.Message = "The gateway process appears to have stopped. Please log in to the diagnostics page to restart."
+		data.ShowRestart = false // M-5: no restart button on unauthenticated page
 	case ReasonNotProvisioned:
 		data.Title = "Your Eva is being set up"
 		data.Message = "Your instance is being provisioned. This usually takes a few minutes."
@@ -53,21 +56,25 @@ func (h *Handler) serveMaintenancePage(w http.ResponseWriter, customerID string,
 	case ReasonNetworkError:
 		data.Title = "Connection issue"
 		data.Message = "Unable to reach your instance. This may be a temporary network issue."
-		data.ShowRestart = true
+		data.ShowRestart = false // M-5: no restart button on unauthenticated page
 	default:
 		data.Title = "Something went wrong"
 		data.Message = "An unexpected error occurred."
-		data.ShowRestart = true
+		data.ShowRestart = false // M-5: no restart button on unauthenticated page
+	}
+
+	// M-6: Render to buffer first to avoid writing headers before knowing if template succeeds
+	var buf bytes.Buffer
+	if err := maintenanceTemplate.Execute(&buf, data); err != nil {
+		slog.Error("failed to render maintenance page", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.WriteHeader(http.StatusServiceUnavailable)
-
-	if err := maintenanceTemplate.Execute(w, data); err != nil {
-		slog.Error("failed to render maintenance page", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-	}
+	buf.WriteTo(w)
 }
 
 // HandleHealthCheck pings the customer VM's gateway and returns health status.

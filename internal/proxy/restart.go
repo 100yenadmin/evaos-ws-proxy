@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const (
@@ -24,7 +25,8 @@ const (
 type RestartManager struct {
 	sshUser    string
 	sshKeyPath string
-	cooldowns  sync.Map // map[customerID]time.Time
+	mu         sync.Mutex            // M-7: mutex for cooldown map
+	cooldowns  map[string]time.Time  // M-7: replaced sync.Map with mutex-protected map
 }
 
 // NewRestartManager creates a new restart manager.
@@ -37,9 +39,23 @@ func NewRestartManager() *RestartManager {
 	if keyPath == "" {
 		keyPath = defaultSSHKeyPath
 	}
+
+	// M-8: Validate SSH key path on startup
+	if info, err := os.Stat(keyPath); err != nil {
+		slog.Warn("SSH key file not found — SSH operations will fail until key is available",
+			"path", keyPath, "error", err)
+	} else {
+		mode := info.Mode().Perm()
+		if mode&0o077 != 0 {
+			slog.Warn("SSH key file has overly permissive permissions — should be 0600 or 0400",
+				"path", keyPath, "mode", fmt.Sprintf("%04o", mode))
+		}
+	}
+
 	return &RestartManager{
 		sshUser:    user,
 		sshKeyPath: keyPath,
+		cooldowns:  make(map[string]time.Time),
 	}
 }
 
@@ -53,8 +69,9 @@ type restartResponse struct {
 
 // CheckCooldown returns the remaining cooldown seconds for a customer, or 0 if ready.
 func (rm *RestartManager) CheckCooldown(customerID string) int {
-	if val, ok := rm.cooldowns.Load(customerID); ok {
-		lastRestart := val.(time.Time)
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if lastRestart, ok := rm.cooldowns[customerID]; ok {
 		elapsed := time.Since(lastRestart)
 		if elapsed < restartCooldown {
 			return int((restartCooldown - elapsed).Seconds()) + 1
@@ -63,10 +80,16 @@ func (rm *RestartManager) CheckCooldown(customerID string) int {
 	return 0
 }
 
+// SetCooldown records a cooldown for a customer. Exported for use by restore endpoint.
+func (rm *RestartManager) SetCooldown(customerID string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.cooldowns[customerID] = time.Now()
+}
+
 // Restart executes a gateway restart on the customer VM via SSH.
 func (rm *RestartManager) Restart(customerID, vmIP string, vmPort int) error {
-	// Record restart time
-	rm.cooldowns.Store(customerID, time.Now())
+	// M-2: Don't set cooldown before execution — set it after success only.
 
 	signer, err := rm.loadSSHKey()
 	if err != nil {
@@ -78,7 +101,7 @@ func (rm *RestartManager) Restart(customerID, vmIP string, vmPort int) error {
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Customer VMs — we control them
+		HostKeyCallback: buildHostKeyCallback(), // M-1: known_hosts verification
 		Timeout:         sshTimeout,
 	}
 
@@ -100,6 +123,9 @@ func (rm *RestartManager) Restart(customerID, vmIP string, vmPort int) error {
 		return fmt.Errorf("restart command failed: %w (output: %s)", err, string(output))
 	}
 
+	// M-2: Only set cooldown after successful restart
+	rm.SetCooldown(customerID)
+
 	slog.Info("gateway restarted via SSH",
 		"customer_id", customerID,
 		"vm_ip", vmIP,
@@ -120,10 +146,40 @@ func (rm *RestartManager) loadSSHKey() (ssh.Signer, error) {
 	return signer, nil
 }
 
+// buildHostKeyCallback returns a known_hosts-based callback if available,
+// falling back to InsecureIgnoreHostKey with a warning. (M-1 fix)
+func buildHostKeyCallback() ssh.HostKeyCallback {
+	home, _ := os.UserHomeDir()
+	knownHostsPath := home + "/.ssh/known_hosts"
+
+	if _, err := os.Stat(knownHostsPath); err == nil {
+		cb, err := knownhosts.New(knownHostsPath)
+		if err == nil {
+			return cb
+		}
+		slog.Warn("failed to parse known_hosts, falling back to insecure",
+			"path", knownHostsPath, "error", err)
+	} else {
+		slog.Warn("known_hosts not found, using insecure host key verification — MITM risk",
+			"path", knownHostsPath)
+	}
+
+	return ssh.InsecureIgnoreHostKey()
+}
+
 // HandleRestart handles POST /vm/{customer_id}/restart requests.
 func (h *Handler) HandleRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// H-2: Origin check to prevent CSRF
+	if !checkOrigin(r) {
+		writeJSON(w, http.StatusForbidden, restartResponse{
+			Status:  "error",
+			Message: "invalid origin",
+		})
 		return
 	}
 
@@ -133,8 +189,8 @@ func (h *Handler) HandleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Require JWT auth
-	tokenStr := extractToken(r)
+	// H-2: Use extractTokenNoCookie to prevent CSRF via cookie-only auth
+	tokenStr := extractTokenNoCookie(r)
 	if tokenStr == "" {
 		writeJSON(w, http.StatusUnauthorized, restartResponse{
 			Status:  "error",

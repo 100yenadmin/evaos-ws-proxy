@@ -756,3 +756,30 @@ func extractToken(r *http.Request) string {
 
 	return ""
 }
+
+// extractTokenNoCookie gets the JWT from Authorization header or query param only.
+// Used for mutating endpoints (POST restart, POST restore) to prevent CSRF via
+// auto-sent browser cookies. (H-2 fix)
+func extractTokenNoCookie(r *http.Request) string {
+	// 1. Authorization: Bearer <token>
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	// 2. Query param ?token=<jwt>
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token
+	}
+
+	return ""
+}
+
+// checkOrigin validates the Origin header on mutating requests to prevent CSRF. (H-2 fix)
+// Returns true if the request is allowed, false if it should be rejected.
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // Non-browser clients (curl, etc.)
+	}
+	return allowedOrigins[origin]
+}

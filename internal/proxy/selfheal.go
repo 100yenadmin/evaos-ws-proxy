@@ -36,7 +36,7 @@ type customerHealState struct {
 type SelfHealBot struct {
 	restarts   *RestartManager
 	vms        VMRegistry
-	alertFn    func(customerID, subject, body string)
+	alertFn    func(ctx context.Context, customerID, subject, body string) // M-4: accepts context
 
 	mu         sync.Mutex
 	states     map[string]*customerHealState
@@ -55,9 +55,15 @@ type SelfHealConfig struct {
 
 // NewSelfHealBot creates a new self-healing bot.
 func NewSelfHealBot(cfg SelfHealConfig) *SelfHealBot {
-	alertFn := cfg.AlertFn
-	if alertFn == nil {
-		alertFn = func(cid, subject, body string) {
+	// Wrap the user-provided alertFn to accept context (M-4)
+	var wrappedAlertFn func(ctx context.Context, customerID, subject, body string)
+	if cfg.AlertFn != nil {
+		userFn := cfg.AlertFn
+		wrappedAlertFn = func(ctx context.Context, cid, subject, body string) {
+			userFn(cid, subject, body)
+		}
+	} else {
+		wrappedAlertFn = func(ctx context.Context, cid, subject, body string) {
 			slog.Warn("self-heal alert (no handler configured)",
 				"customer_id", cid, "subject", subject, "body", body)
 		}
@@ -65,7 +71,7 @@ func NewSelfHealBot(cfg SelfHealConfig) *SelfHealBot {
 	return &SelfHealBot{
 		restarts:   cfg.RestartManager,
 		vms:        cfg.VMRegistry,
-		alertFn:    alertFn,
+		alertFn:    wrappedAlertFn,
 		states:     make(map[string]*customerHealState),
 		customers:  cfg.CustomerIDs,
 		healLog:    make([]HealAction, 0, 100),
@@ -117,12 +123,12 @@ func (b *SelfHealBot) checkAll(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			b.checkCustomer(cid)
+			b.checkCustomer(ctx, cid)
 		}
 	}
 }
 
-func (b *SelfHealBot) checkCustomer(customerID string) {
+func (b *SelfHealBot) checkCustomer(ctx context.Context, customerID string) {
 	vm, err := b.vms.LookupByCustomerID(customerID)
 	if err != nil || vm == nil {
 		return
@@ -156,7 +162,10 @@ func (b *SelfHealBot) checkCustomer(customerID string) {
 			state.crashLoop = true
 			b.mu.Unlock()
 			b.logAction(customerID, "crash-loop-detected", true, "")
-			b.alertFn(customerID,
+			// M-4: Use context with timeout for alert callback
+			alertCtx, alertCancel := context.WithTimeout(ctx, 10*time.Second)
+			defer alertCancel()
+			b.alertFn(alertCtx, customerID,
 				fmt.Sprintf("evaOS ALERT: %s crash-looping", customerID),
 				fmt.Sprintf("Customer %s has had %d restarts in the last 10 minutes. Auto-restart disabled. Manual intervention needed.", customerID, len(state.restartTimes)),
 			)
@@ -167,7 +176,7 @@ func (b *SelfHealBot) checkCustomer(customerID string) {
 	}
 	state.crashLoop = false
 
-	// Check cooldown before attempting restart
+	// M-7: Check cooldown while still holding the lock to prevent race
 	cooldownRemaining := b.restarts.CheckCooldown(customerID)
 	b.mu.Unlock()
 
@@ -189,9 +198,16 @@ func (b *SelfHealBot) checkCustomer(customerID string) {
 	state.restartTimes = append(state.restartTimes, now)
 	b.mu.Unlock()
 
-	// Schedule an alert if still down after the cooldown period
+	// M-4: Schedule an alert with context timeout to prevent goroutine leak
 	go func() {
-		time.Sleep(alertCooldownAfterRestart)
+		// Wait for the cooldown period, but respect context cancellation
+		select {
+		case <-time.After(alertCooldownAfterRestart):
+			// continue to check health
+		case <-ctx.Done():
+			return // M-4: exit cleanly on cancellation
+		}
+
 		if !b.pingGateway(vm.EffectiveIP(), vm.GatewayPort) {
 			b.mu.Lock()
 			lastAlert := state.lastAlert
@@ -202,7 +218,10 @@ func (b *SelfHealBot) checkCustomer(customerID string) {
 				state.lastAlert = time.Now()
 				b.mu.Unlock()
 
-				b.alertFn(customerID,
+				// M-4: Use context with timeout for alert callback
+				alertCtx, alertCancel := context.WithTimeout(ctx, 10*time.Second)
+				defer alertCancel()
+				b.alertFn(alertCtx, customerID,
 					fmt.Sprintf("evaOS ALERT: %s still down after restart", customerID),
 					fmt.Sprintf("Customer %s gateway is still unreachable after auto-restart. Manual intervention needed.", customerID),
 				)

@@ -149,7 +149,7 @@ func TestSelfHealBot_AlertCallback(t *testing.T) {
 
 	// The crash loop detection happens in checkCustomer, which needs a VM
 	// So we verify alert function was properly configured
-	bot.alertFn("test", "test subject", "test body")
+	bot.alertFn(context.Background(), "test", "test subject", "test body")
 	mu.Lock()
 	if len(alerts) != 1 || alerts[0] != "test subject" {
 		t.Errorf("expected alert with 'test subject', got %v", alerts)

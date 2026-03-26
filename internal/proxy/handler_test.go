@@ -1125,8 +1125,9 @@ func TestHandleHTTPProxy_BackendDown(t *testing.T) {
 	if !strings.Contains(body, "evaOS") {
 		t.Error("expected maintenance page with evaOS branding")
 	}
-	if !strings.Contains(body, "Restart Eva") {
-		t.Error("expected restart button on maintenance page")
+	// M-5: Maintenance page should show Contact Support, NOT restart button
+	if !strings.Contains(body, "Contact Support") {
+		t.Error("expected Contact Support link on maintenance page")
 	}
 
 	// Non-UI path: still returns raw 502
@@ -1260,7 +1261,9 @@ func TestMaintenancePage_ProvisioningReason(t *testing.T) {
 	}
 }
 
-func TestMaintenancePage_BackendDownShowsRestart(t *testing.T) {
+func TestMaintenancePage_BackendDownShowsSupport(t *testing.T) {
+	// M-5: Maintenance page no longer shows restart button (unauthenticated)
+	// Instead it shows Contact Support link
 	h := newTestHandler(
 		&mockJWT{},
 		&mockRegistry{vm: &registry.VMInfo{
@@ -1275,8 +1278,12 @@ func TestMaintenancePage_BackendDownShowsRestart(t *testing.T) {
 	h.HandleHTTPProxy(w, req)
 
 	body := w.Body.String()
-	if !strings.Contains(body, "Restart Eva") {
-		t.Error("expected restart button when backend is down")
+	if !strings.Contains(body, "Contact Support") {
+		t.Error("expected Contact Support link when backend is down")
+	}
+	// M-5: Restart button should NOT be shown on unauthenticated maintenance page
+	if strings.Contains(body, `id="restartBtn"`) {
+		t.Error("restart button should not appear on unauthenticated maintenance page")
 	}
 }
 
@@ -1467,7 +1474,7 @@ func TestRestartManager_Cooldown(t *testing.T) {
 	}
 
 	// Record a restart
-	rm.cooldowns.Store("cust-1", time.Now())
+	rm.SetCooldown("cust-1")
 
 	// Should be in cooldown now
 	remaining := rm.CheckCooldown("cust-1")
@@ -1481,7 +1488,9 @@ func TestRestartManager_Cooldown(t *testing.T) {
 	}
 
 	// Expired cooldown
-	rm.cooldowns.Store("cust-3", time.Now().Add(-130*time.Second))
+	rm.mu.Lock()
+	rm.cooldowns["cust-3"] = time.Now().Add(-130 * time.Second)
+	rm.mu.Unlock()
 	if r := rm.CheckCooldown("cust-3"); r != 0 {
 		t.Errorf("expected 0 for expired cooldown, got %d", r)
 	}
@@ -1490,7 +1499,7 @@ func TestRestartManager_Cooldown(t *testing.T) {
 func TestRestart_Cooldown(t *testing.T) {
 	rm := NewRestartManager()
 	// Pre-set cooldown
-	rm.cooldowns.Store("cust-1", time.Now())
+	rm.SetCooldown("cust-1")
 
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},

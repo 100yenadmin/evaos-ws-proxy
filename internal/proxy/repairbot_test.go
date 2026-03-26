@@ -70,17 +70,18 @@ func newTestHandlerWithDiag(jwt JWTValidator, vms VMRegistry, diag DiagnosticsRu
 func TestRepairBot_RendersDiagnosticPage(t *testing.T) {
 	diag := &mockDiagnostics{}
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
-			CustomerID: "golden",
-			UserID:     "user-1",
-			TailnetIP:  strPtr("100.64.0.1"),
+			CustomerID:  "golden",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("100.64.0.1"),
 			GatewayPort: 18789,
 		}},
 		diag,
 	)
 
 	req := httptest.NewRequest("GET", "/vm/golden/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleRepairBot(w, req)
 
@@ -111,8 +112,13 @@ func TestRepairBot_RendersDiagnosticPage(t *testing.T) {
 }
 
 func TestRepairBot_NoVMShowsProvisioning(t *testing.T) {
-	h := newTestHandlerWithDiag(&mockJWT{}, &mockRegistry{vm: nil}, &mockDiagnostics{})
+	h := newTestHandlerWithDiag(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: nil},
+		&mockDiagnostics{},
+	)
 	req := httptest.NewRequest("GET", "/vm/new-customer/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleRepairBot(w, req)
 
@@ -148,17 +154,18 @@ func TestRepairBot_InvalidCustomerID(t *testing.T) {
 func TestRepairBot_NoDiagnosticsConfigured(t *testing.T) {
 	// When diagnostics runner is nil, page should still render (with fallback)
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
-			CustomerID: "golden",
-			UserID:     "user-1",
-			TailnetIP:  strPtr("127.0.0.1"),
+			CustomerID:  "golden",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
 			GatewayPort: 59999, // not listening
 		}},
 		nil, // no diagnostics runner
 	)
 
 	req := httptest.NewRequest("GET", "/vm/golden/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleRepairBot(w, req)
 
@@ -176,11 +183,11 @@ func TestRepairBot_DoesNotTriggerRestart(t *testing.T) {
 	rm := NewRestartManager()
 	diag := &mockDiagnostics{}
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
-			CustomerID: "golden",
-			UserID:     "user-1",
-			TailnetIP:  strPtr("100.64.0.1"),
+			CustomerID:  "golden",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("100.64.0.1"),
 			GatewayPort: 18789,
 		}},
 		diag,
@@ -188,6 +195,7 @@ func TestRepairBot_DoesNotTriggerRestart(t *testing.T) {
 	)
 
 	req := httptest.NewRequest("GET", "/vm/golden/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleRepairBot(w, req)
 
@@ -199,7 +207,28 @@ func TestRepairBot_DoesNotTriggerRestart(t *testing.T) {
 
 func TestRepairBot_MobileResponsive(t *testing.T) {
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "golden",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+		&mockDiagnostics{},
+	)
+	req := httptest.NewRequest("GET", "/vm/golden/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleRepairBot(w, req)
+	if !strings.Contains(w.Body.String(), "viewport") {
+		t.Error("repairbot page must include viewport meta for mobile")
+	}
+}
+
+// --- H-1: RepairBot page requires auth ---
+
+func TestRepairBot_RequiresAuth(t *testing.T) {
+	h := newTestHandlerWithDiag(
+		&mockJWT{err: fmt.Errorf("no token")},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "golden",
 			UserID:     "user-1",
@@ -210,8 +239,35 @@ func TestRepairBot_MobileResponsive(t *testing.T) {
 	req := httptest.NewRequest("GET", "/vm/golden/repairbot", nil)
 	w := httptest.NewRecorder()
 	h.HandleRepairBot(w, req)
-	if !strings.Contains(w.Body.String(), "viewport") {
-		t.Error("repairbot page must include viewport meta for mobile")
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Login Required") {
+		t.Error("expected unauth page with Login Required")
+	}
+	if !strings.Contains(body, "Contact Support") {
+		t.Error("expected unauth page with Contact Support link")
+	}
+}
+
+func TestRepairBot_ForbiddenForWrongUser(t *testing.T) {
+	h := newTestHandlerWithDiag(
+		&mockJWT{claims: &auth.Claims{UserID: "wrong-user", Email: "hacker@evil.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "golden",
+			UserID:     "user-owner",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+		&mockDiagnostics{},
+	)
+	req := httptest.NewRequest("GET", "/vm/golden/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleRepairBot(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
 	}
 }
 
@@ -230,7 +286,7 @@ func TestRepairBotAPI_ReturnsDiagnostics(t *testing.T) {
 		},
 	}
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "golden",
 			UserID:     "user-1",
@@ -240,6 +296,7 @@ func TestRepairBotAPI_ReturnsDiagnostics(t *testing.T) {
 	)
 
 	req := httptest.NewRequest("GET", "/vm/golden/repairbot/api", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleRepairBotAPI(w, req)
 
@@ -260,8 +317,13 @@ func TestRepairBotAPI_ReturnsDiagnostics(t *testing.T) {
 }
 
 func TestRepairBotAPI_NoVM(t *testing.T) {
-	h := newTestHandlerWithDiag(&mockJWT{}, &mockRegistry{vm: nil}, &mockDiagnostics{})
+	h := newTestHandlerWithDiag(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: nil},
+		&mockDiagnostics{},
+	)
 	req := httptest.NewRequest("GET", "/vm/missing/repairbot/api", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleRepairBotAPI(w, req)
 
@@ -272,6 +334,21 @@ func TestRepairBotAPI_NoVM(t *testing.T) {
 	json.NewDecoder(w.Body).Decode(&resp)
 	if resp["vm_reachable"] != false {
 		t.Error("expected vm_reachable=false")
+	}
+}
+
+// H-1: RepairBot API requires auth
+func TestRepairBotAPI_RequiresAuth(t *testing.T) {
+	h := newTestHandlerWithDiag(
+		&mockJWT{err: fmt.Errorf("no token")},
+		&mockRegistry{vm: nil},
+		&mockDiagnostics{},
+	)
+	req := httptest.NewRequest("GET", "/vm/golden/repairbot/api", nil)
+	w := httptest.NewRecorder()
+	h.HandleRepairBotAPI(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
 	}
 }
 
@@ -403,7 +480,7 @@ func TestRepairBotRestore_RequiresAuth(t *testing.T) {
 
 func TestRepairBotRestore_Cooldown(t *testing.T) {
 	rm := NewRestartManager()
-	rm.cooldowns.Store("golden", time.Now())
+	rm.SetCooldown("golden")
 
 	h := newTestHandlerWithDiag(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
@@ -451,12 +528,86 @@ func TestRepairBotRestore_MissingFilename(t *testing.T) {
 	}
 }
 
+// H-2: CSRF protection on restore endpoint
+func TestRepairBotRestore_RejectsBadOrigin(t *testing.T) {
+	h := newTestHandlerWithDiag(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "golden",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+		&mockDiagnostics{},
+	)
+
+	body := strings.NewReader(`{"filename":"/root/.openclaw/openclaw.json.backup-20260325"}`)
+	req := httptest.NewRequest("POST", "/vm/golden/repairbot/restore", body)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Origin", "https://evil.com")
+	w := httptest.NewRecorder()
+	h.HandleRepairBotRestore(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for bad origin, got %d", w.Code)
+	}
+}
+
+// H-2: Restore rejects cookie-only auth
+func TestRepairBotRestore_RejectsCookieOnlyAuth(t *testing.T) {
+	h := newTestHandlerWithDiag(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "golden",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+		&mockDiagnostics{},
+	)
+
+	body := strings.NewReader(`{"filename":"/root/.openclaw/openclaw.json.backup-20260325"}`)
+	req := httptest.NewRequest("POST", "/vm/golden/repairbot/restore", body)
+	// Only cookie auth, no Authorization header
+	req.AddCookie(&http.Cookie{Name: "sb-abc-auth-token", Value: "cookie-jwt"})
+	w := httptest.NewRecorder()
+	h.HandleRepairBotRestore(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for cookie-only auth on mutating endpoint, got %d", w.Code)
+	}
+}
+
+// M-3: Request body size limit on restore
+func TestRepairBotRestore_RejectsLargeBody(t *testing.T) {
+	h := newTestHandlerWithDiag(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "golden",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+		&mockDiagnostics{},
+	)
+
+	// Create a body larger than 1KB
+	largeBody := strings.Repeat("x", 2048)
+	body := strings.NewReader(`{"filename":"` + largeBody + `"}`)
+	req := httptest.NewRequest("POST", "/vm/golden/repairbot/restore", body)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.HandleRepairBotRestore(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for oversized body, got %d", w.Code)
+	}
+}
+
 // --- ServeHTTP routing tests for RepairBot ---
 
 func TestServeHTTP_RoutesToRepairBot(t *testing.T) {
 	diag := &mockDiagnostics{}
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "golden",
 			UserID:     "user-1",
@@ -467,7 +618,9 @@ func TestServeHTTP_RoutesToRepairBot(t *testing.T) {
 	server := httptest.NewServer(h)
 	defer server.Close()
 
-	resp, err := http.Get(server.URL + "/vm/golden/repairbot")
+	req, _ := http.NewRequest("GET", server.URL+"/vm/golden/repairbot", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -480,14 +633,16 @@ func TestServeHTTP_RoutesToRepairBot(t *testing.T) {
 
 func TestServeHTTP_RoutesToRepairBotAPI(t *testing.T) {
 	h := newTestHandlerWithDiag(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: nil},
 		&mockDiagnostics{},
 	)
 	server := httptest.NewServer(h)
 	defer server.Close()
 
-	resp, err := http.Get(server.URL + "/vm/golden/repairbot/api")
+	req, _ := http.NewRequest("GET", server.URL+"/vm/golden/repairbot/api", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -537,5 +692,47 @@ func TestServeHTTP_RoutesToRestore(t *testing.T) {
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+// --- H-2: CSRF protection on restart endpoint ---
+
+func TestRestart_RejectsBadOrigin(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Origin", "https://evil.com")
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for bad origin, got %d", w.Code)
+	}
+}
+
+func TestRestart_RejectsCookieOnlyAuth(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	// Only cookie auth, no Authorization header
+	req.AddCookie(&http.Cookie{Name: "sb-abc-auth-token", Value: "cookie-jwt"})
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for cookie-only auth on mutating endpoint, got %d", w.Code)
 	}
 }

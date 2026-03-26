@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -123,7 +125,7 @@ func (d *SSHDiagnostics) sshClient(vmIP string) (*ssh.Client, error) {
 	config := &ssh.ClientConfig{
 		User:            d.sshUser,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: buildHostKeyCallback(), // M-1: known_hosts verification
 		Timeout:         sshTimeout,
 	}
 	return ssh.Dial("tcp", fmt.Sprintf("%s:22", vmIP), config)
@@ -442,20 +444,26 @@ func (d *SSHDiagnostics) ListBackups(vmIP string) ([]BackupInfo, error) {
 	return backups, nil
 }
 
+// validBackupFilename is a strict allowlist regex for backup filenames.
+// Accepts full paths like /root/.openclaw/openclaw.json.backup-20260325
+// or /home/user/.openclaw/openclaw.json.backup-2026-03-25_10-00-00
+// H-3: Replaced fragile blocklist with strict allowlist.
+var validBackupFilename = regexp.MustCompile(
+	`^(/root/\.openclaw/|/home/[a-zA-Z0-9_-]+/\.openclaw/)openclaw\.json\.backup-[a-zA-Z0-9_.-]+$`,
+)
+
 // RestoreBackup restores a config backup on the VM and restarts the gateway.
 func (d *SSHDiagnostics) RestoreBackup(customerID, vmIP, backupFilename string) error {
-	// Validate filename to prevent path traversal
-	if strings.Contains(backupFilename, "..") || strings.Contains(backupFilename, ";") ||
-		strings.Contains(backupFilename, "|") || strings.Contains(backupFilename, "&") ||
-		strings.Contains(backupFilename, "`") || strings.Contains(backupFilename, "$") ||
-		strings.Contains(backupFilename, "'") || strings.Contains(backupFilename, "\"") ||
-		strings.Contains(backupFilename, "\n") {
+	// H-3: Strict allowlist validation — only accept well-formed backup paths
+	if !validBackupFilename.MatchString(backupFilename) {
 		return fmt.Errorf("invalid backup filename")
 	}
 
-	// Must match expected backup path pattern
-	if !strings.Contains(backupFilename, "openclaw.json.backup-") {
-		return fmt.Errorf("invalid backup filename: must be an openclaw.json.backup-* file")
+	// H-3: Additional path traversal check — verify the filename resolves within the expected directory
+	dir := filepath.Dir(backupFilename)
+	rel, err := filepath.Rel(dir, backupFilename)
+	if err != nil || strings.Contains(rel, "..") {
+		return fmt.Errorf("invalid backup filename: path traversal detected")
 	}
 
 	// Backup current config, then restore, then restart

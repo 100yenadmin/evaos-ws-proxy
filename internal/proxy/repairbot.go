@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,7 +12,7 @@ import (
 
 // HandleRepairBot serves the diagnostic dashboard page.
 // Route: GET /vm/{customer_id}/repairbot
-// This is read-only — it doesn't restart or modify anything.
+// H-1: Requires JWT auth. Unauthenticated users see a minimal "please log in" page.
 func (h *Handler) HandleRepairBot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -24,9 +25,17 @@ func (h *Handler) HandleRepairBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional JWT auth — if present, validate it. But the page works without auth
-	// (like the maintenance page) since it's read-only diagnostics.
-	// This allows non-technical users to access it from a support email link.
+	// H-1: Require JWT auth on repairbot endpoints
+	tokenStr := extractToken(r)
+	if tokenStr == "" {
+		h.serveRepairBotUnauthPage(w, customerID)
+		return
+	}
+	claims, err := h.jwt.Validate(tokenStr)
+	if err != nil {
+		h.serveRepairBotUnauthPage(w, customerID)
+		return
+	}
 
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
@@ -36,6 +45,12 @@ func (h *Handler) HandleRepairBot(w http.ResponseWriter, r *http.Request) {
 	}
 	if vm == nil {
 		h.serveRepairBotPage(w, customerID, nil, "not_provisioned")
+		return
+	}
+
+	// H-1: Verify ownership (unless admin)
+	if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
 		return
 	}
 
@@ -145,14 +160,20 @@ func (h *Handler) HandleRepairBotRestore(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// H-2: Origin check to prevent CSRF
+	if !checkOrigin(r) {
+		writeJSON(w, http.StatusForbidden, restartResponse{Status: "error", Message: "invalid origin"})
+		return
+	}
+
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
 		http.Error(w, "invalid customer_id", http.StatusBadRequest)
 		return
 	}
 
-	// Require JWT auth
-	tokenStr := extractToken(r)
+	// H-2: Use extractTokenNoCookie to prevent CSRF via cookie-only auth
+	tokenStr := extractTokenNoCookie(r)
 	if tokenStr == "" {
 		writeJSON(w, http.StatusUnauthorized, restartResponse{Status: "error", Message: "unauthorized"})
 		return
@@ -188,6 +209,9 @@ func (h *Handler) HandleRepairBotRestore(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// M-3: Limit request body size to 1KB to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+
 	// Parse request body
 	var body struct {
 		Filename string `json:"filename"`
@@ -203,7 +227,7 @@ func (h *Handler) HandleRepairBotRestore(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Record cooldown (restore triggers a restart)
-	h.restarts.cooldowns.Store(customerID, timeNow())
+	h.restarts.SetCooldown(customerID)
 
 	// Execute restore in background
 	go func() {
@@ -225,6 +249,7 @@ func (h *Handler) HandleRepairBotRestore(w http.ResponseWriter, r *http.Request)
 
 // HandleRepairBotAPI returns diagnostic results as JSON (for AJAX from the page).
 // Route: GET /vm/{customer_id}/repairbot/api
+// H-1: Requires JWT auth.
 func (h *Handler) HandleRepairBotAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -234,6 +259,18 @@ func (h *Handler) HandleRepairBotAPI(w http.ResponseWriter, r *http.Request) {
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
 		http.Error(w, "invalid customer_id", http.StatusBadRequest)
+		return
+	}
+
+	// H-1: Require JWT auth on repairbot API
+	tokenStr := extractToken(r)
+	if tokenStr == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	claims, err := h.jwt.Validate(tokenStr)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 		return
 	}
 
@@ -248,6 +285,12 @@ func (h *Handler) HandleRepairBotAPI(w http.ResponseWriter, r *http.Request) {
 			"overall_status": "unknown",
 			"vm_reachable":   false,
 		})
+		return
+	}
+
+	// H-1: Verify ownership (unless admin)
+	if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
 		return
 	}
 
@@ -270,7 +313,26 @@ func (h *Handler) HandleRepairBotAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, report)
 }
 
+// serveRepairBotUnauthPage renders a minimal branded page for unauthenticated users. (H-1 fix)
+func (h *Handler) serveRepairBotUnauthPage(w http.ResponseWriter, customerID string) {
+	data := struct {
+		CustomerID string
+	}{CustomerID: customerID}
+
+	var buf bytes.Buffer
+	if err := repairBotUnauthTemplate.Execute(&buf, data); err != nil {
+		slog.Error("failed to render repairbot unauth page", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusUnauthorized)
+	buf.WriteTo(w)
+}
+
 // serveRepairBotPage renders the RepairBot diagnostic dashboard page.
+// M-6: Renders template to buffer first, then writes to avoid partial response on error.
 func (h *Handler) serveRepairBotPage(w http.ResponseWriter, customerID string, report *DiagnosticReport, mode string) {
 	data := repairBotData{
 		CustomerID:   customerID,
@@ -286,19 +348,24 @@ func (h *Handler) serveRepairBotPage(w http.ResponseWriter, customerID string, r
 		data.HasBackups = len(report.Backups) > 0
 	}
 
+	// M-6: Render to buffer first to avoid writing headers before knowing if template succeeds
+	var buf bytes.Buffer
+	if err := repairBotTemplate.Execute(&buf, data); err != nil {
+		slog.Error("failed to render repairbot page", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 
 	if mode == "not_provisioned" || mode == "vm_lookup_failed" {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	} else {
-		w.WriteHeader(http.StatusOK) // Diagnostic mode — always 200
+		w.WriteHeader(http.StatusOK)
 	}
 
-	if err := repairBotTemplate.Execute(w, data); err != nil {
-		slog.Error("failed to render repairbot page", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-	}
+	buf.WriteTo(w)
 }
 
 // repairBotData is the template data for the RepairBot page.

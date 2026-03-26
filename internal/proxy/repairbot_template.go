@@ -12,6 +12,44 @@ var repairBotFuncMap = template.FuncMap{
 
 var repairBotTemplate = template.Must(template.New("repairbot").Funcs(repairBotFuncMap).Parse(repairBotHTML))
 
+// H-1: Minimal branded page for unauthenticated users hitting /repairbot
+var repairBotUnauthTemplate = template.Must(template.New("repairbot-unauth").Parse(repairBotUnauthHTML))
+
+const repairBotUnauthHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evaOS RepairBot — Login Required</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0f;--text:#e0e0e8;--dim:#6b6b80;--accent:#00d4ff;--accent2:#7b61ff;--card:#16162a;--border:#1e1e3a;--glow:rgba(0,212,255,0.15)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.container{max-width:480px;width:100%;text-align:center}
+.logo{font-size:28px;font-weight:700;letter-spacing:2px;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:40px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:40px 32px;box-shadow:0 0 40px var(--glow)}
+.icon{font-size:48px;margin-bottom:24px}
+h1{font-size:22px;font-weight:600;margin-bottom:12px}
+.message{color:var(--dim);font-size:15px;line-height:1.5;margin-bottom:28px}
+.btn-secondary{display:inline-block;color:var(--accent);font-size:14px;text-decoration:none;margin-top:16px;padding:8px 16px;border:1px solid var(--border);border-radius:8px;transition:all 0.2s}
+.btn-secondary:hover{border-color:var(--accent);background:rgba(0,212,255,0.05)}
+footer{margin-top:32px;color:var(--dim);font-size:12px;opacity:0.6}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="logo">evaOS RepairBot</div>
+  <div class="card">
+    <div class="icon">🔒</div>
+    <h1>Login Required</h1>
+    <p class="message">Please log in to access diagnostics for your Eva instance.</p>
+    <a href="mailto:androiddreams@electricsheephq.com?subject=evaOS%20Support%20-%20{{.CustomerID}}" class="btn-secondary">Contact Support</a>
+  </div>
+  <footer>evaOS by Electric Sheep</footer>
+</div>
+</body>
+</html>`
+
 const repairBotHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
