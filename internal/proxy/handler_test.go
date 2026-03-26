@@ -885,9 +885,14 @@ func TestHandleHTTPProxy_UIPathSkipsAuth(t *testing.T) {
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
-	// Should get 404 (no VM) instead of 401 (no auth) — proves auth was skipped
-	if w.Code != http.StatusNotFound {
-		t.Errorf("expected 404 (no VM, auth skipped), got %d", w.Code)
+	// Should get 503 with maintenance page (no VM, shows provisioning page) instead of 401 — proves auth was skipped
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 (maintenance page, auth skipped), got %d", w.Code)
+	}
+	// Verify it's the maintenance page, not a raw error
+	body := w.Body.String()
+	if !strings.Contains(body, "evaOS") {
+		t.Error("expected maintenance page with evaOS branding")
 	}
 }
 
@@ -896,12 +901,24 @@ func TestHandleHTTPProxy_NoVM(t *testing.T) {
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: nil},
 	)
-	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	// Non-UI path still returns 404
+	req := httptest.NewRequest("GET", "/vm/cust-1/api/status", nil)
 	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 	if w.Code != http.StatusNotFound {
-		t.Errorf("expected 404, got %d", w.Code)
+		t.Errorf("expected 404 for non-UI path, got %d", w.Code)
+	}
+
+	// UI path returns maintenance page
+	req2 := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	w2 := httptest.NewRecorder()
+	h.HandleHTTPProxy(w2, req2)
+	if w2.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 maintenance page for UI path, got %d", w2.Code)
+	}
+	if !strings.Contains(w2.Body.String(), "being set up") {
+		t.Error("expected provisioning message in maintenance page")
 	}
 }
 
@@ -1095,13 +1112,31 @@ func TestHandleHTTPProxy_BackendDown(t *testing.T) {
 		}},
 	)
 
+	// UI path: shows maintenance page (503) instead of raw 502
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
 	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 
-	if w.Code != http.StatusBadGateway {
-		t.Errorf("expected 502, got %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 (maintenance page), got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "evaOS") {
+		t.Error("expected maintenance page with evaOS branding")
+	}
+	// M-5: Maintenance page should show Contact Support, NOT restart button
+	if !strings.Contains(body, "Contact Support") {
+		t.Error("expected Contact Support link on maintenance page")
+	}
+
+	// Non-UI path: still returns raw 502
+	req2 := httptest.NewRequest("GET", "/vm/cust-1/api/status", nil)
+	req2.Header.Set("Authorization", "Bearer valid-token")
+	w2 := httptest.NewRecorder()
+	h.HandleHTTPProxy(w2, req2)
+	if w2.Code != http.StatusBadGateway {
+		t.Errorf("expected 502 for non-UI path, got %d", w2.Code)
 	}
 }
 
@@ -1174,6 +1209,392 @@ func TestServeHTTP_DispatchesCorrectly(t *testing.T) {
 	}
 	if string(msg) != "ws-ok" {
 		t.Errorf("WS dispatch: got %q, want 'ws-ok'", string(msg))
+	}
+}
+
+// --- Maintenance page tests ---
+
+func TestMaintenancePage_Branding(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", w.Code)
+	}
+	body := w.Body.String()
+
+	// Verify branding elements
+	checks := []string{
+		"evaOS",
+		"Electric Sheep",
+		"androiddreams@electricsheephq.com",
+		"Contact Support",
+		"cust-1", // customer ID should be present
+	}
+	for _, check := range checks {
+		if !strings.Contains(body, check) {
+			t.Errorf("maintenance page missing %q", check)
+		}
+	}
+
+	// Verify Content-Type
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Errorf("expected text/html Content-Type, got %q", ct)
+	}
+}
+
+func TestMaintenancePage_ProvisioningReason(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "being set up") {
+		t.Error("expected provisioning message for nil VM")
+	}
+	// Should NOT show restart button for provisioning
+	if strings.Contains(body, `id="restartBtn"`) {
+		t.Error("should not show restart button for provisioning state")
+	}
+}
+
+func TestMaintenancePage_BackendDownShowsSupport(t *testing.T) {
+	// M-5: Maintenance page no longer shows restart button (unauthenticated)
+	// Instead it shows Contact Support link
+	h := newTestHandler(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999,
+		}},
+	)
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "Contact Support") {
+		t.Error("expected Contact Support link when backend is down")
+	}
+	// M-5: Restart button should NOT be shown on unauthenticated maintenance page
+	if strings.Contains(body, `id="restartBtn"`) {
+		t.Error("restart button should not appear on unauthenticated maintenance page")
+	}
+}
+
+func TestMaintenancePage_MobileResponsive(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "viewport") {
+		t.Error("maintenance page must include viewport meta tag for mobile responsiveness")
+	}
+}
+
+// --- Health-check endpoint tests ---
+
+func TestHealthCheck_NoVM(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	w := httptest.NewRecorder()
+	h.HandleHealthCheck(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["healthy"] != false {
+		t.Error("expected healthy=false for no VM")
+	}
+	if resp["gateway_status"] != "not_provisioned" {
+		t.Errorf("expected gateway_status=not_provisioned, got %v", resp["gateway_status"])
+	}
+}
+
+func TestHealthCheck_BackendHealthy(t *testing.T) {
+	// Mock healthy backend
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandler(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr(backendHost),
+			GatewayPort: backendPort,
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	w := httptest.NewRecorder()
+	h.HandleHealthCheck(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["healthy"] != true {
+		t.Error("expected healthy=true for running backend")
+	}
+	if resp["gateway_status"] != "active" {
+		t.Errorf("expected gateway_status=active, got %v", resp["gateway_status"])
+	}
+}
+
+func TestHealthCheck_BackendDown(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999, // not listening
+		}},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	w := httptest.NewRecorder()
+	h.HandleHealthCheck(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["healthy"] != false {
+		t.Error("expected healthy=false for unreachable backend")
+	}
+}
+
+func TestHealthCheck_MethodNotAllowed(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{})
+	req := httptest.NewRequest("POST", "/vm/cust-1/health-check", nil)
+	w := httptest.NewRecorder()
+	h.HandleHealthCheck(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+// --- Restart endpoint tests ---
+
+func TestRestart_NoAuth(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{})
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestRestart_InvalidToken(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{err: fmt.Errorf("invalid token")},
+		&mockRegistry{},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	req.Header.Set("Authorization", "Bearer bad-token")
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestRestart_NoVM(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: nil},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestRestart_Forbidden(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-wrong", Email: "hacker@evil.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-owner",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestRestart_MethodNotAllowed(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{})
+	req := httptest.NewRequest("GET", "/vm/cust-1/restart", nil)
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+// --- Rate limiting tests ---
+
+func TestRestartManager_Cooldown(t *testing.T) {
+	rm := NewRestartManager()
+
+	// Initially no cooldown
+	if remaining := rm.CheckCooldown("cust-1"); remaining != 0 {
+		t.Errorf("expected 0 cooldown initially, got %d", remaining)
+	}
+
+	// Record a restart
+	rm.SetCooldown("cust-1")
+
+	// Should be in cooldown now
+	remaining := rm.CheckCooldown("cust-1")
+	if remaining <= 0 || remaining > 121 {
+		t.Errorf("expected cooldown 1-121 seconds, got %d", remaining)
+	}
+
+	// Different customer should not be affected
+	if r := rm.CheckCooldown("cust-2"); r != 0 {
+		t.Errorf("expected 0 cooldown for different customer, got %d", r)
+	}
+
+	// Expired cooldown
+	rm.mu.Lock()
+	rm.cooldowns["cust-3"] = time.Now().Add(-130 * time.Second)
+	rm.mu.Unlock()
+	if r := rm.CheckCooldown("cust-3"); r != 0 {
+		t.Errorf("expected 0 for expired cooldown, got %d", r)
+	}
+}
+
+func TestRestart_Cooldown(t *testing.T) {
+	rm := NewRestartManager()
+	// Pre-set cooldown
+	rm.SetCooldown("cust-1")
+
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("100.64.0.1"),
+		}},
+		func(cfg *HandlerConfig) {
+			cfg.RestartManager = rm
+		},
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/restart", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleRestart(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 for cooldown, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "cooldown" {
+		t.Errorf("expected status=cooldown, got %v", resp["status"])
+	}
+	if resp["remaining_seconds"] == nil || resp["remaining_seconds"].(float64) <= 0 {
+		t.Error("expected positive remaining_seconds")
+	}
+}
+
+// --- ServeHTTP routing tests for new endpoints ---
+
+func TestServeHTTP_RoutesToHealthCheck(t *testing.T) {
+	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/vm/cust-1/health-check")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["healthy"] != false {
+		t.Error("expected healthy=false")
+	}
+}
+
+func TestServeHTTP_RoutesToRestart(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{err: fmt.Errorf("no token")},
+		&mockRegistry{},
+	)
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	req, _ := http.NewRequest("POST", server.URL+"/vm/cust-1/restart", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Should get 401 (no token) — proves routing worked
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+// --- Error classification tests ---
+
+func TestClassifyBackendError(t *testing.T) {
+	tests := []struct {
+		errMsg   string
+		expected ErrorReason
+	}{
+		{"connection refused", ReasonBackendDown},
+		{"dial tcp: connection refused", ReasonBackendDown},
+		{"no such host", ReasonNetworkError},
+		{"no route to host", ReasonNetworkError},
+		{"context deadline exceeded", ReasonNetworkError},
+		{"timeout", ReasonNetworkError},
+		{"random error", ReasonBackendDown},
+	}
+	for _, tt := range tests {
+		got := classifyBackendError(fmt.Errorf("%s", tt.errMsg))
+		if got != tt.expected {
+			t.Errorf("classifyBackendError(%q) = %q, want %q", tt.errMsg, got, tt.expected)
+		}
 	}
 }
 
