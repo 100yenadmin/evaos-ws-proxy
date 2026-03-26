@@ -2,9 +2,9 @@ package proxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/100yenadmin/evaos-ws-proxy/internal/auth"
@@ -94,23 +94,26 @@ func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
 	var receivedPath string
 	var receivedHeaders http.Header
 
-	// Mock file server on a random port
-	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Mock file server on port 8890 (File Browser port).
+	// The file proxy hardcodes fileBrowserPort=8890, so we must listen there.
+	listener, err := net.Listen("tcp", "127.0.0.1:8890")
+	if err != nil {
+		t.Skipf("cannot bind to port 8890 (may be in use): %v", err)
+	}
+	fileServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedPath = r.URL.Path
 		receivedHeaders = r.Header.Clone()
 		w.Header().Set("Content-Type", "application/pdf")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("fake-pdf-content"))
 	}))
+	fileServer.Listener.Close()
+	fileServer.Listener = listener
+	fileServer.Start()
 	defer fileServer.Close()
 
-	backendAddr := strings.TrimPrefix(fileServer.URL, "http://")
-	parts := strings.Split(backendAddr, ":")
-	backendHost := parts[0]
-	var backendPort int
-	fmt.Sscanf(parts[1], "%d", &backendPort)
-
-	// The file proxy uses vm.GatewayPort, so our mock VM points to the test server.
+	// The file proxy uses fileBrowserPort (8890), so our mock VM just needs
+	// the correct IP (127.0.0.1). GatewayPort is irrelevant for file proxy.
 
 	// Test: verify the handler calls through correctly with session auth
 	secret := "test-file-secret"
@@ -125,8 +128,8 @@ func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:  "cust-1",
 			UserID:      "user-1",
-			TailnetIP:   strPtr(backendHost),
-			GatewayPort: backendPort,
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 18789,
 		}},
 		secret,
 	)

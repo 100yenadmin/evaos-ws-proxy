@@ -13,12 +13,16 @@ import (
 // maxFileBodySize limits file uploads through the proxy to 100MB.
 const maxFileBodySize = 100 << 20 // 100 MiB
 
-// HandleFileProxy serves files from a customer's VM gateway file-browser plugin.
+// fileBrowserPort is the port where File Browser (filebrowser.org) runs on each VM.
+// File Browser runs in noauth mode — the proxy is the sole auth layer.
+const fileBrowserPort = 8890
+
+// HandleFileProxy serves files from a customer's VM via File Browser (filebrowser.org).
 // Route: /vm/{customer_id}/files/{path...}
-// Auth: Supabase JWT or session cookie (same as other authenticated routes).
-// The /vm/{customer_id}/files prefix is stripped before proxying.
-// Requests are forwarded to the VM's gateway port (vm.GatewayPort) where the
-// file-browser plugin is registered at /files with auth: "gateway".
+// Auth: Supabase JWT or session cookie (proxy handles all authentication).
+// File Browser runs on port 8890 with --noauth, so the proxy is the only auth layer.
+// The /vm/{customer_id} prefix is stripped; /files/* is passed through as-is
+// since File Browser is configured with baseURL=/files.
 func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	// File Browser uses GET, HEAD, POST, PUT, PATCH, DELETE for its full UI.
 	// Allow all standard methods.
@@ -131,8 +135,10 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		"file_path", filePath,
 	)
 
-	// --- Reverse proxy to VM file server ---
-	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), vm.GatewayPort)
+	// --- Reverse proxy to File Browser (port 8890, noauth) ---
+	// File Browser runs standalone on the VM, NOT behind the OpenClaw gateway.
+	// Auth is handled entirely by the proxy (Supabase JWT/session above).
+	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), fileBrowserPort)
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		logger.Error("invalid file server URL", "url", backendURL, "error", err)
@@ -150,34 +156,20 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
 			req.Host = target.Host
 
-			// Set trusted-proxy headers
-			req.Header.Set("X-Forwarded-User", customerID)
-			req.Header.Set("X-Forwarded-Customer", customerID)
+			// Set forwarding headers
 			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
 
-			// Remove browser auth headers first
+			// Remove browser auth headers — File Browser runs noauth,
+			// no credentials needed. Stripping prevents accidental leaks.
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
-
-			// Inject gateway token as Authorization: Bearer for the file-browser
-			// plugin (auth: "gateway"). The gateway validates Bearer tokens for
-			// HTTP routes with auth: "gateway".
-			if token := vm.EffectiveToken(); token != "" {
-				req.Header.Set("Authorization", "Bearer "+token)
-			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// Set CORS headers for file downloads
 			origin := r.Header.Get("Origin")
 			if origin != "" && allowedOrigins[origin] {
 				resp.Header.Set("Access-Control-Allow-Origin", origin)
-			}
-
-			// Force download for non-HTML content
-			ct := resp.Header.Get("Content-Type")
-			if !strings.Contains(ct, "text/html") && resp.Header.Get("Content-Disposition") == "" {
-				// Let the browser decide — don't force download for images/PDFs
 			}
 
 			// Cache shared files for 5 minutes
