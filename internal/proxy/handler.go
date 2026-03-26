@@ -61,6 +61,7 @@ type HandlerConfig struct {
 	VMRegistry        VMRegistry
 	Health            *health.Handler
 	RestartManager    *RestartManager
+	Diagnostics       DiagnosticsRunner
 	AdminEmails       []string
 	ConnectTimeout    time.Duration
 	ReconnectAttempts int
@@ -74,6 +75,7 @@ type Handler struct {
 	vms               VMRegistry
 	health            *health.Handler
 	restarts          *RestartManager
+	diagnostics       DiagnosticsRunner
 	adminEmails       map[string]bool
 	connectTimeout    time.Duration
 	reconnectAttempts int
@@ -101,6 +103,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		vms:               cfg.VMRegistry,
 		health:            cfg.Health,
 		restarts:          restarts,
+		diagnostics:       cfg.Diagnostics,
 		adminEmails:       adminSet,
 		connectTimeout:    cfg.ConnectTimeout,
 		reconnectAttempts: cfg.ReconnectAttempts,
@@ -473,6 +476,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case backendPath == "/health-check" && r.Method == http.MethodGet:
 			h.HandleHealthCheck(w, r)
+			return
+		case backendPath == "/repairbot" && r.Method == http.MethodGet:
+			h.HandleRepairBot(w, r)
+			return
+		case backendPath == "/repairbot/api" && r.Method == http.MethodGet:
+			h.HandleRepairBotAPI(w, r)
+			return
+		case backendPath == "/repairbot/backups" && r.Method == http.MethodGet:
+			h.HandleRepairBotBackups(w, r)
+			return
+		case backendPath == "/repairbot/restore" && r.Method == http.MethodPost:
+			h.HandleRepairBotRestore(w, r)
 			return
 		}
 	}
