@@ -503,6 +503,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Handle bare /files/... requests (no /vm/{cid} prefix).
+	// File Browser's JS makes absolute-path API calls like /files/api/resources/
+	// because its baseURL is "/files". These need to be routed to the correct VM.
+	// We look up the customer_id from the session cookie.
+	if strings.HasPrefix(r.URL.Path, "/files/") || r.URL.Path == "/files" {
+		h.HandleBareFileProxy(w, r)
+		return
+	}
+
 	// Route API endpoints before the general proxy handler
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID != "" {
