@@ -830,6 +830,21 @@ func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// Set the real session cookie
 	h.sessions.SetSessionCookie(w, sessionToken)
 
+	// Set the gateway token cookie (JS-readable, NOT HttpOnly)
+	// so evaos-override.js can read it and auto-connect without exposing the token in the URL.
+	if gwToken := vm.EffectiveToken(); gwToken != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "evaos_gw_token",
+			Value:    gwToken,
+			Domain:   sessionCookieDomain,
+			Path:     fmt.Sprintf("/vm/%s/", url.PathEscape(customerID)),
+			MaxAge:   int(sessionMaxAge.Seconds()),
+			HttpOnly: false, // JS needs to read this
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+
 	// Redirect to the UI
 	redirectURL := fmt.Sprintf("/vm/%s/ui/", url.PathEscape(customerID))
 	http.Redirect(w, r, redirectURL, http.StatusFound)

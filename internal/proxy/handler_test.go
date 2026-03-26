@@ -1878,6 +1878,7 @@ func TestHandleAuthCallback_ValidCallbackToken(t *testing.T) {
 			CustomerID: "cust-1",
 			UserID:     "user-1",
 			TailnetIP:  strPtr("127.0.0.1"),
+			GatewayToken: strPtr("test-gw-token"),
 		}},
 		Health:         health.NewHandler(),
 		MaxConnections: 100,
@@ -1896,17 +1897,28 @@ func TestHandleAuthCallback_ValidCallbackToken(t *testing.T) {
 	if loc != "/vm/cust-1/ui/" {
 		t.Errorf("Location = %q, want /vm/cust-1/ui/", loc)
 	}
-	// Verify cookie was set
+	// Verify cookies were set
 	cookies := w.Result().Cookies()
-	var found bool
+	var foundSession, foundGwToken bool
 	for _, c := range cookies {
 		if c.Name == "evaos_session" {
-			found = true
-			break
+			foundSession = true
+		}
+		if c.Name == "evaos_gw_token" {
+			foundGwToken = true
+			if c.HttpOnly {
+				t.Error("evaos_gw_token should NOT be HttpOnly (JS needs to read it)")
+			}
+			if c.Path != "/vm/cust-1/" {
+				t.Errorf("evaos_gw_token path = %q, want /vm/cust-1/", c.Path)
+			}
 		}
 	}
-	if !found {
+	if !foundSession {
 		t.Error("expected evaos_session cookie to be set")
+	}
+	if !foundGwToken {
+		t.Error("expected evaos_gw_token cookie to be set")
 	}
 }
 
