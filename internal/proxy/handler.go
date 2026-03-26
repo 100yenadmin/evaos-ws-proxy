@@ -516,6 +516,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case backendPath == "/repairbot/restore" && r.Method == http.MethodPost:
 			h.HandleRepairBotRestore(w, r)
 			return
+		case strings.HasPrefix(backendPath, "/files"):
+			h.HandleFileProxy(w, r)
+			return
 		}
 	}
 
