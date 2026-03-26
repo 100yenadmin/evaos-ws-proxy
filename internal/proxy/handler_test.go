@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -876,23 +879,22 @@ func TestHandleHTTPProxy_InvalidToken(t *testing.T) {
 	}
 }
 
-func TestHandleHTTPProxy_UIPathSkipsAuth(t *testing.T) {
-	// UI paths should not require JWT — VM lookup still needed
+func TestHandleHTTPProxy_UIPathRequiresAuth(t *testing.T) {
+	// C-2 fix: UI paths now require auth — no session, no JWT → redirect to login
 	h := newTestHandler(
 		&mockJWT{}, // no valid claims
-		&mockRegistry{vm: nil}, // but no VM either
+		&mockRegistry{vm: nil},
 	)
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
-	// Should get 503 with maintenance page (no VM, shows provisioning page) instead of 401 — proves auth was skipped
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503 (maintenance page, auth skipped), got %d", w.Code)
+	// Should redirect to login page
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 redirect to login, got %d", w.Code)
 	}
-	// Verify it's the maintenance page, not a raw error
-	body := w.Body.String()
-	if !strings.Contains(body, "evaOS") {
-		t.Error("expected maintenance page with evaOS branding")
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "electricsheephq.com/login") {
+		t.Errorf("expected redirect to login page, got Location=%q", loc)
 	}
 }
 
@@ -910,15 +912,13 @@ func TestHandleHTTPProxy_NoVM(t *testing.T) {
 		t.Errorf("expected 404 for non-UI path, got %d", w.Code)
 	}
 
-	// UI path returns maintenance page
+	// UI path with auth returns maintenance page
 	req2 := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req2.Header.Set("Authorization", "Bearer valid-token")
 	w2 := httptest.NewRecorder()
 	h.HandleHTTPProxy(w2, req2)
-	if w2.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503 maintenance page for UI path, got %d", w2.Code)
-	}
-	if !strings.Contains(w2.Body.String(), "being set up") {
-		t.Error("expected provisioning message in maintenance page")
+	if w2.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for UI path with auth (no VM), got %d", w2.Code)
 	}
 }
 
@@ -1101,8 +1101,15 @@ func TestHandleHTTPProxy_CacheHeaders(t *testing.T) {
 }
 
 func TestHandleHTTPProxy_BackendDown(t *testing.T) {
-	// Point to a port that's not listening
-	h := newTestHandler(
+	// Point to a port that's not listening. Use session auth for UI path.
+	secret := "test-bd-secret"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:  "cust-1",
@@ -1110,11 +1117,12 @@ func TestHandleHTTPProxy_BackendDown(t *testing.T) {
 			TailnetIP:   strPtr("127.0.0.1"),
 			GatewayPort: 59999, // not listening
 		}},
+		secret,
 	)
 
-	// UI path: shows maintenance page (503) instead of raw 502
+	// UI path with session auth: shows maintenance page (503) instead of raw 502
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
-	req.Header.Set("Authorization", "Bearer valid-token")
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 
@@ -1125,7 +1133,6 @@ func TestHandleHTTPProxy_BackendDown(t *testing.T) {
 	if !strings.Contains(body, "evaOS") {
 		t.Error("expected maintenance page with evaOS branding")
 	}
-	// M-5: Maintenance page should show Contact Support, NOT restart button
 	if !strings.Contains(body, "Contact Support") {
 		t.Error("expected Contact Support link on maintenance page")
 	}
@@ -1215,8 +1222,21 @@ func TestServeHTTP_DispatchesCorrectly(t *testing.T) {
 // --- Maintenance page tests ---
 
 func TestMaintenancePage_Branding(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	// Use session auth to access UI path, with nil VM → maintenance page
+	secret := "test-mp-secret"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: nil},
+		secret,
+	)
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 
@@ -1246,8 +1266,16 @@ func TestMaintenancePage_Branding(t *testing.T) {
 }
 
 func TestMaintenancePage_ProvisioningReason(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	secret := "test-mp-secret"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(&mockJWT{}, &mockRegistry{vm: nil}, secret)
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 
@@ -1262,9 +1290,14 @@ func TestMaintenancePage_ProvisioningReason(t *testing.T) {
 }
 
 func TestMaintenancePage_BackendDownShowsSupport(t *testing.T) {
-	// M-5: Maintenance page no longer shows restart button (unauthenticated)
-	// Instead it shows Contact Support link
-	h := newTestHandler(
+	secret := "test-mp-secret"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(
 		&mockJWT{},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:  "cust-1",
@@ -1272,8 +1305,10 @@ func TestMaintenancePage_BackendDownShowsSupport(t *testing.T) {
 			TailnetIP:   strPtr("127.0.0.1"),
 			GatewayPort: 59999,
 		}},
+		secret,
 	)
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 
@@ -1281,15 +1316,22 @@ func TestMaintenancePage_BackendDownShowsSupport(t *testing.T) {
 	if !strings.Contains(body, "Contact Support") {
 		t.Error("expected Contact Support link when backend is down")
 	}
-	// M-5: Restart button should NOT be shown on unauthenticated maintenance page
 	if strings.Contains(body, `id="restartBtn"`) {
 		t.Error("restart button should not appear on unauthenticated maintenance page")
 	}
 }
 
 func TestMaintenancePage_MobileResponsive(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	secret := "test-mp-secret"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(&mockJWT{}, &mockRegistry{vm: nil}, secret)
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
 
@@ -1301,10 +1343,31 @@ func TestMaintenancePage_MobileResponsive(t *testing.T) {
 
 // --- Health-check endpoint tests ---
 
-func TestHealthCheck_NoVM(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+func TestHealthCheck_NoAuth(t *testing.T) {
+	// M-2: health-check requires auth now
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: nil},
+		"test-hc-secret",
+	)
 
 	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	w := httptest.NewRecorder()
+	h.HandleHealthCheck(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated health-check, got %d", w.Code)
+	}
+}
+
+func TestHealthCheck_NoVM(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: nil},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleHealthCheck(w, req)
 
@@ -1336,7 +1399,7 @@ func TestHealthCheck_BackendHealthy(t *testing.T) {
 	fmt.Sscanf(parts[1], "%d", &backendPort)
 
 	h := newTestHandler(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:  "cust-1",
 			UserID:      "user-1",
@@ -1346,6 +1409,7 @@ func TestHealthCheck_BackendHealthy(t *testing.T) {
 	)
 
 	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleHealthCheck(w, req)
 
@@ -1361,7 +1425,7 @@ func TestHealthCheck_BackendHealthy(t *testing.T) {
 
 func TestHealthCheck_BackendDown(t *testing.T) {
 	h := newTestHandler(
-		&mockJWT{},
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:  "cust-1",
 			UserID:      "user-1",
@@ -1371,6 +1435,7 @@ func TestHealthCheck_BackendDown(t *testing.T) {
 	)
 
 	req := httptest.NewRequest("GET", "/vm/cust-1/health-check", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
 	w := httptest.NewRecorder()
 	h.HandleHealthCheck(w, req)
 
@@ -1534,11 +1599,16 @@ func TestRestart_Cooldown(t *testing.T) {
 // --- ServeHTTP routing tests for new endpoints ---
 
 func TestServeHTTP_RoutesToHealthCheck(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: nil})
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: nil},
+	)
 	server := httptest.NewServer(h)
 	defer server.Close()
 
-	resp, err := http.Get(server.URL + "/vm/cust-1/health-check")
+	req, _ := http.NewRequest("GET", server.URL+"/vm/cust-1/health-check", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -1772,8 +1842,8 @@ func TestHandleHTTPProxy_SessionCookie_WrongUser(t *testing.T) {
 	}
 }
 
-func TestHandleHTTPProxy_NoAuth_UIPath_FallsThrough(t *testing.T) {
-	// Without session manager, UI path still skips auth (backward compat)
+func TestHandleHTTPProxy_NoAuth_UIPath_RedirectsToLogin(t *testing.T) {
+	// C-2 fix: UI paths without auth redirect to login
 	h := newTestHandler(
 		&mockJWT{},
 		&mockRegistry{vm: nil},
@@ -1781,32 +1851,41 @@ func TestHandleHTTPProxy_NoAuth_UIPath_FallsThrough(t *testing.T) {
 	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
 	w := httptest.NewRecorder()
 	h.HandleHTTPProxy(w, req)
-	// Should get maintenance page (no VM), not 401
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503 (maintenance), got %d", w.Code)
+	// Should redirect to login, not 503 maintenance page
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 redirect to login, got %d", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "electricsheephq.com/login") {
+		t.Errorf("expected redirect to login page, got Location=%q", loc)
 	}
 }
 
-func TestHandleAuthCallback_ValidSession(t *testing.T) {
+func TestHandleAuthCallback_ValidCallbackToken(t *testing.T) {
 	secret := "test-session-secret"
 	sm := NewSessionManager([]byte(secret))
 
-	token, _ := sm.GenerateSessionToken(SessionClaims{
+	// H-1: Generate a callback token (not a session token directly)
+	cbToken, _ := sm.GenerateCallbackToken(SessionClaims{
 		UserID: "user-1",
 		Email:  "test@test.com",
 	})
 
-	h := newTestHandlerWithSessions(
-		&mockJWT{},
-		&mockRegistry{vm: &registry.VMInfo{
+	// Must use the SAME SessionManager instance so pending session map is shared
+	h := NewHandler(HandlerConfig{
+		JWTValidator:   &mockJWT{},
+		VMRegistry: &mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "cust-1",
 			UserID:     "user-1",
 			TailnetIP:  strPtr("127.0.0.1"),
 		}},
-		secret,
-	)
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		ConnectTimeout: 5 * time.Second,
+		SessionManager: sm,
+	})
 
-	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+token, nil)
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+cbToken, nil)
 	w := httptest.NewRecorder()
 	h.HandleAuthCallback(w, req)
 
@@ -1828,6 +1907,83 @@ func TestHandleAuthCallback_ValidSession(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected evaos_session cookie to be set")
+	}
+}
+
+func TestHandleAuthCallback_CallbackTokenReplay(t *testing.T) {
+	// H-1: Callback token is single-use — second use must fail
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	cbToken, _ := sm.GenerateCallbackToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := NewHandler(HandlerConfig{
+		JWTValidator:   &mockJWT{},
+		VMRegistry: &mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		ConnectTimeout: 5 * time.Second,
+		SessionManager: sm,
+	})
+
+	// First use — should succeed
+	req1 := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+cbToken, nil)
+	w1 := httptest.NewRecorder()
+	h.HandleAuthCallback(w1, req1)
+	if w1.Code != http.StatusFound {
+		t.Errorf("first use: expected 302, got %d", w1.Code)
+	}
+
+	// Second use — should fail (single-use)
+	req2 := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+cbToken, nil)
+	w2 := httptest.NewRecorder()
+	h.HandleAuthCallback(w2, req2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Errorf("replay: expected 401, got %d", w2.Code)
+	}
+}
+
+func TestHandleAuthCallback_CallbackTokenExpired(t *testing.T) {
+	// H-1: Callback tokens expire after 30 seconds
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	// Manually create an expired callback token
+	cbClaims := CallbackTokenClaims{
+		Type: "callback",
+		Ref:  "expired-ref",
+		Exp:  time.Now().Add(-1 * time.Minute).Unix(), // already expired
+	}
+	payload, _ := json.Marshal(cbClaims)
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payload)
+	signingInput := sessionHeader + "." + payloadB64
+	mac := hmac.New(sha256.New, sm.secret)
+	mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	expiredToken := signingInput + "." + sig
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+expiredToken, nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthCallback(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for expired callback token, got %d", w.Code)
 	}
 }
 
@@ -1870,22 +2026,25 @@ func TestHandleAuthCallback_Forbidden(t *testing.T) {
 	secret := "test-session-secret"
 	sm := NewSessionManager([]byte(secret))
 
-	token, _ := sm.GenerateSessionToken(SessionClaims{
+	cbToken, _ := sm.GenerateCallbackToken(SessionClaims{
 		UserID: "user-wrong",
 		Email:  "wrong@example.com",
 	})
 
-	h := newTestHandlerWithSessions(
-		&mockJWT{},
-		&mockRegistry{vm: &registry.VMInfo{
+	h := NewHandler(HandlerConfig{
+		JWTValidator:   &mockJWT{},
+		VMRegistry: &mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "cust-1",
 			UserID:     "user-owner",
 			TailnetIP:  strPtr("127.0.0.1"),
 		}},
-		secret,
-	)
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		ConnectTimeout: 5 * time.Second,
+		SessionManager: sm,
+	})
 
-	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+token, nil)
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+cbToken, nil)
 	w := httptest.NewRecorder()
 	h.HandleAuthCallback(w, req)
 
@@ -1918,8 +2077,9 @@ func TestHandleAuthSession_ValidJWT(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp["session_token"] == "" {
-		t.Error("expected non-empty session_token")
+	// H-1: session_token is no longer returned in the response (security fix)
+	if resp["session_token"] != "" {
+		t.Error("session_token should not be in response (H-1 fix)")
 	}
 	if resp["redirect_url"] == "" {
 		t.Error("expected non-empty redirect_url")
@@ -2002,20 +2162,24 @@ func TestHandleAuthSessionCORS_Preflight(t *testing.T) {
 func TestServeHTTP_RoutesToAuthCallback(t *testing.T) {
 	secret := "test-session-secret"
 	sm := NewSessionManager([]byte(secret))
-	token, _ := sm.GenerateSessionToken(SessionClaims{
+	// Use callback token now (H-1)
+	cbToken, _ := sm.GenerateCallbackToken(SessionClaims{
 		UserID: "user-1",
 		Email:  "test@test.com",
 	})
 
-	h := newTestHandlerWithSessions(
-		&mockJWT{},
-		&mockRegistry{vm: &registry.VMInfo{
+	h := NewHandler(HandlerConfig{
+		JWTValidator:   &mockJWT{},
+		VMRegistry: &mockRegistry{vm: &registry.VMInfo{
 			CustomerID: "cust-1",
 			UserID:     "user-1",
 			TailnetIP:  strPtr("127.0.0.1"),
 		}},
-		secret,
-	)
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		ConnectTimeout: 5 * time.Second,
+		SessionManager: sm,
+	})
 
 	server := httptest.NewServer(h)
 	defer server.Close()
@@ -2025,7 +2189,7 @@ func TestServeHTTP_RoutesToAuthCallback(t *testing.T) {
 		return http.ErrUseLastResponse
 	}}
 
-	resp, err := client.Get(server.URL + "/vm/cust-1/auth/callback?session=" + token)
+	resp, err := client.Get(server.URL + "/vm/cust-1/auth/callback?session=" + cbToken)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -2033,5 +2197,241 @@ func TestServeHTTP_RoutesToAuthCallback(t *testing.T) {
 
 	if resp.StatusCode != http.StatusFound {
 		t.Errorf("expected 302, got %d", resp.StatusCode)
+	}
+}
+
+// --- Audit fix tests ---
+
+// C-1: WS connection with no auth → 401
+func TestHandleWebSocket_UIPath_NoAuth(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+	)
+	// UI WS path with NO auth at all
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/", nil)
+	w := httptest.NewRecorder()
+	h.HandleWebSocket(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("C-1: UI WS with no auth: expected 401, got %d", w.Code)
+	}
+}
+
+// H-3: Logout endpoint clears cookie
+func TestHandleLogout(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{},
+		"test-logout-secret",
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/logout", nil)
+	w := httptest.NewRecorder()
+	h.HandleLogout(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 redirect, got %d", w.Code)
+	}
+
+	// Verify cookie is cleared (MaxAge=-1)
+	cookies := w.Result().Cookies()
+	var found bool
+	for _, c := range cookies {
+		if c.Name == "evaos_session" {
+			found = true
+			if c.MaxAge != -1 {
+				t.Errorf("expected MaxAge=-1 for cookie clear, got %d", c.MaxAge)
+			}
+			if c.Value != "" {
+				t.Errorf("expected empty cookie value, got %q", c.Value)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected evaos_session cookie to be set (cleared)")
+	}
+
+	// Verify redirect to login page
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "electricsheephq.com/login") {
+		t.Errorf("expected redirect to login page, got Location=%q", loc)
+	}
+}
+
+// H-3: Logout routed via ServeHTTP
+func TestServeHTTP_RoutesToLogout(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{},
+		"test-logout-secret",
+	)
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	resp, err := client.Get(server.URL + "/vm/cust-1/auth/logout")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302, got %d", resp.StatusCode)
+	}
+}
+
+// L-3: CORS multi-origin support
+func TestCORS_MultiOrigin(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{},
+		"test-cors-secret",
+	)
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	// Test with non-www origin
+	req, _ := http.NewRequest("OPTIONS", server.URL+"/vm/cust-1/auth/session", nil)
+	req.Header.Set("Origin", "https://electricsheephq.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	got := resp.Header.Get("Access-Control-Allow-Origin")
+	if got != "https://electricsheephq.com" {
+		t.Errorf("CORS origin = %q, want https://electricsheephq.com", got)
+	}
+
+	// Test with localhost dev origin
+	req2, _ := http.NewRequest("OPTIONS", server.URL+"/vm/cust-1/auth/session", nil)
+	req2.Header.Set("Origin", "http://localhost:5173")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	got2 := resp2.Header.Get("Access-Control-Allow-Origin")
+	if got2 != "http://localhost:5173" {
+		t.Errorf("CORS origin = %q, want http://localhost:5173", got2)
+	}
+}
+
+// M-1: Cookie domain scoped to ecs.electricsheephq.com
+func TestSessionCookieDomain(t *testing.T) {
+	sm := NewSessionManager([]byte("test-domain-secret"))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	w := httptest.NewRecorder()
+	sm.SetSessionCookie(w, token)
+
+	cookies := w.Result().Cookies()
+	for _, c := range cookies {
+		if c.Name == "evaos_session" {
+			// Go normalizes by stripping leading dot, so we check for the ecs prefix
+			if !strings.Contains(c.Domain, "ecs") {
+				t.Errorf("M-1: cookie domain = %q, should contain 'ecs'", c.Domain)
+			}
+			return
+		}
+	}
+	t.Error("evaos_session cookie not found")
+}
+
+// H-2: Derived key differs from raw secret
+func TestDeriveKey(t *testing.T) {
+	baseSecret := "test-secret"
+	derived := DeriveKey(baseSecret, "evaos-proxy-session-v1")
+
+	// Derived key should NOT equal the raw secret bytes
+	if string(derived) == baseSecret {
+		t.Error("derived key should differ from base secret")
+	}
+
+	// Same purpose → same key (deterministic)
+	derived2 := DeriveKey(baseSecret, "evaos-proxy-session-v1")
+	if string(derived) != string(derived2) {
+		t.Error("same base+purpose should produce same derived key")
+	}
+
+	// Different purpose → different key
+	derived3 := DeriveKey(baseSecret, "different-purpose")
+	if string(derived) == string(derived3) {
+		t.Error("different purpose should produce different derived key")
+	}
+}
+
+// H-1: Full auth session flow with callback tokens
+func TestHandleAuthSession_ReturnsCallbackToken(t *testing.T) {
+	secret := "test-cb-flow-secret"
+	h := newTestHandlerWithSessions(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/auth/session", nil)
+	req.Header.Set("Authorization", "Bearer valid-jwt")
+	w := httptest.NewRecorder()
+	h.HandleAuthSession(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	// session_token should NOT be in response anymore
+	if resp["session_token"] != "" {
+		t.Error("H-1: session_token should not be exposed in response")
+	}
+
+	// redirect_url should contain callback token
+	redirectURL := resp["redirect_url"]
+	if !strings.Contains(redirectURL, "/auth/callback?session=") {
+		t.Errorf("expected redirect_url with callback token, got %q", redirectURL)
+	}
+}
+
+// H-3: Session TTL reduced to 4h
+func TestSessionMaxAge_FourHours(t *testing.T) {
+	sm := NewSessionManager([]byte("test-ttl"))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	claims, err := sm.ValidateSessionToken(token)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	remaining := time.Until(time.Unix(claims.Exp, 0))
+	// Should be ~4h, not 24h
+	if remaining > 5*time.Hour {
+		t.Errorf("session TTL too long: %v (expected ~4h)", remaining)
+	}
+	if remaining < 3*time.Hour {
+		t.Errorf("session TTL too short: %v (expected ~4h)", remaining)
 	}
 }

@@ -93,11 +93,13 @@ func main() {
 	vmRegistry := registry.NewSupabaseRegistry(appCtx, cfg.SupabaseURL, cfg.SupabaseServiceKey, cfg.VMCacheTTL)
 	healthHandler := health.NewHandler()
 
-	// Session manager for cookie-based auth (uses JWT secret as HMAC key)
+	// Session manager for cookie-based auth
+	// H-2 fix: derive a separate key for session signing instead of reusing Supabase JWT secret directly
 	var sessionMgr *proxy.SessionManager
 	if cfg.SupabaseJWTSecret != "" {
-		sessionMgr = proxy.NewSessionManager([]byte(cfg.SupabaseJWTSecret))
-		slog.Info("session auth enabled")
+		sessionKey := proxy.DeriveKey(cfg.SupabaseJWTSecret, "evaos-proxy-session-v1")
+		sessionMgr = proxy.NewSessionManager(sessionKey)
+		slog.Info("session auth enabled (derived key)")
 	} else {
 		slog.Warn("session auth disabled — SUPABASE_JWT_SECRET not set")
 	}

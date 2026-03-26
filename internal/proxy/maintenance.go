@@ -79,6 +79,7 @@ func (h *Handler) serveMaintenancePage(w http.ResponseWriter, customerID string,
 
 // HandleHealthCheck pings the customer VM's gateway and returns health status.
 // Route: GET /vm/{customer_id}/health-check
+// M-2 fix: requires session cookie or JWT auth to prevent customer_id enumeration.
 func (h *Handler) HandleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -91,8 +92,27 @@ func (h *Handler) HandleHealthCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Strip the health-check suffix to get customer_id
-	// Path is /vm/{customer_id}/health-check
+	// M-2: Require auth (session cookie or JWT)
+	authed := false
+	if h.sessions != nil {
+		if sessionToken := GetSessionCookie(r); sessionToken != "" {
+			if _, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
+				authed = true
+			}
+		}
+	}
+	if !authed {
+		tokenStr := extractToken(r)
+		if tokenStr == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if _, err := h.jwt.Validate(tokenStr); err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
 		slog.Error("health-check: vm lookup failed", "error", err, "customer_id", customerID)

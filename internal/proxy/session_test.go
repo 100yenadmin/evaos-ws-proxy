@@ -154,8 +154,8 @@ func TestSessionManager_SetAndGetCookie(t *testing.T) {
 	if found.SameSite != http.SameSiteLaxMode {
 		t.Error("cookie should be SameSite=Lax")
 	}
-	// Go's net/http normalizes cookie domains by stripping the leading dot
-	expectedDomain := "electricsheephq.com"
+	// M-1: Cookie domain scoped to ecs.electricsheephq.com
+	expectedDomain := "ecs.electricsheephq.com"
 	if found.Domain != expectedDomain {
 		t.Errorf("cookie domain = %q, want %q", found.Domain, expectedDomain)
 	}
@@ -180,22 +180,22 @@ func TestSessionManager_GetSessionCookie_Missing(t *testing.T) {
 func TestSessionManager_ShouldRenew(t *testing.T) {
 	sm := NewSessionManager([]byte("test-secret"))
 
-	// Token with plenty of time left — should NOT renew
+	// Token with plenty of time left — should NOT renew (renew window is 1h)
 	freshClaims := &SessionClaims{
 		UserID: "user-123",
-		Exp:    time.Now().Add(20 * time.Hour).Unix(),
+		Exp:    time.Now().Add(3 * time.Hour).Unix(),
 	}
 	if sm.ShouldRenew(freshClaims) {
-		t.Error("should not renew token with 20h remaining")
+		t.Error("should not renew token with 3h remaining")
 	}
 
-	// Token close to expiry — SHOULD renew
+	// Token close to expiry — SHOULD renew (less than 1h)
 	staleClaims := &SessionClaims{
 		UserID: "user-123",
-		Exp:    time.Now().Add(2 * time.Hour).Unix(),
+		Exp:    time.Now().Add(30 * time.Minute).Unix(),
 	}
 	if !sm.ShouldRenew(staleClaims) {
-		t.Error("should renew token with 2h remaining")
+		t.Error("should renew token with 30min remaining")
 	}
 }
 
@@ -226,10 +226,10 @@ func TestSessionManager_RenewSessionToken(t *testing.T) {
 		t.Errorf("Email changed: %q vs %q", renewed.Email, original.Email)
 	}
 
-	// New expiry should be ~24h from now, not 1h
+	// New expiry should be ~4h from now, not 1h (H-3: reduced from 24h to 4h)
 	remaining := time.Until(time.Unix(renewed.Exp, 0))
-	if remaining < 23*time.Hour {
-		t.Errorf("renewed expiry too soon: %v remaining", remaining)
+	if remaining < 3*time.Hour || remaining > 5*time.Hour {
+		t.Errorf("renewed expiry unexpected: %v remaining (expected ~4h)", remaining)
 	}
 }
 

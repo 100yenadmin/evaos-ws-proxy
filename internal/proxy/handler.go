@@ -161,9 +161,8 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Determine if this is a native UI WS connection (path contains /ui).
-	// Native UI connections authenticate with the gateway token directly —
-	// the proxy just passes through and the gateway handles auth.
+	// C-1 fix: ALL WebSocket connections require authentication.
+	// No bypass for UI WS paths — session cookie or JWT required.
 	backendPathWS := stripVMPrefix(r.URL.Path, customerID)
 	isUIWS := strings.HasPrefix(backendPathWS, "/ui")
 
@@ -183,8 +182,8 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !authedViaSessionWS && !isUIWS {
-		// Non-UI WS: require Supabase JWT (dashboard/API connections)
+	if !authedViaSessionWS {
+		// Require Supabase JWT for ALL WS connections without session cookie
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
 			slog.Info("auth failed: no token provided",
@@ -258,15 +257,13 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorization: for non-UI WS, verify the user owns this VM (unless admin)
-	// UI WS connections are authenticated by the gateway via gateway token
-	if claims != nil {
-		if vm.UserID != claims.UserID && !h.isAdmin(userEmail) {
-			logger.Warn("user does not own this VM",
-				"vm_user_id", vm.UserID, "email", userEmail)
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
+	// Authorization: verify the user owns this VM (unless admin)
+	// C-1 fix: claims are always set at this point — check is unconditional
+	if vm.UserID != claims.UserID && !h.isAdmin(userEmail) {
+		logger.Warn("user does not own this VM",
+			"vm_user_id", vm.UserID, "email", userEmail)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
 	}
 
 	logger = logger.With("ip", vm.EffectiveIP(), "gateway_port", vm.GatewayPort)
@@ -498,6 +495,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case backendPath == "/auth/session" && r.Method == http.MethodOptions:
 			h.HandleAuthSessionCORS(w, r)
 			return
+		case backendPath == "/auth/logout" && r.Method == http.MethodGet:
+			h.HandleLogout(w, r)
+			return
 		case backendPath == "/restart" && r.Method == http.MethodPost:
 			h.HandleRestart(w, r)
 			return
@@ -551,60 +551,77 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	if h.sessions != nil {
 		if sessionToken := GetSessionCookie(r); sessionToken != "" {
 			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
-				// Valid session — verify ownership/admin
+				// Valid session — verify ownership/admin if VM exists
 				vm, err := h.vms.LookupByCustomerID(customerID)
 				if err == nil && vm != nil {
 					if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
 						userID = sessionClaims.UserID
 						authedViaSession = true
-						// Renew cookie if close to expiry
-						if h.sessions.ShouldRenew(sessionClaims) {
-							if renewed, err := h.sessions.RenewSessionToken(sessionClaims); err == nil {
-								h.sessions.SetSessionCookie(w, renewed)
-							}
-						}
 					} else {
 						http.Error(w, "forbidden", http.StatusForbidden)
 						return
+					}
+				} else {
+					// VM not found or lookup error — user is still authenticated,
+					// let the request through to show maintenance/provisioning page
+					userID = sessionClaims.UserID
+					authedViaSession = true
+				}
+				// Renew cookie if close to expiry
+				if authedViaSession && h.sessions.ShouldRenew(sessionClaims) {
+					if renewed, err := h.sessions.RenewSessionToken(sessionClaims); err == nil {
+						h.sessions.SetSessionCookie(w, renewed)
 					}
 				}
 			}
 		}
 	}
 
+	// C-2 fix: ALL HTTP paths require authentication. No isUIPath bypass.
 	if !authedViaSession {
-		if !isUIPath {
-			tokenStr := extractToken(r)
-			if tokenStr == "" {
+		tokenStr := extractToken(r)
+		if tokenStr == "" {
+			if isUIPath {
+				// Redirect to login page for UI paths
+				loginURL := fmt.Sprintf("https://www.electricsheephq.com/login?redirect=/vm/%s/ui/",
+					url.PathEscape(customerID))
+				http.Redirect(w, r, loginURL, http.StatusFound)
+			} else {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
 			}
-			claims, err := h.jwt.Validate(tokenStr)
-			if err != nil {
-				slog.Info("http proxy auth failed",
-					"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+			return
+		}
+		claims, err := h.jwt.Validate(tokenStr)
+		if err != nil {
+			slog.Info("http proxy auth failed",
+				"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+			if isUIPath {
+				loginURL := fmt.Sprintf("https://www.electricsheephq.com/login?redirect=/vm/%s/ui/",
+					url.PathEscape(customerID))
+				http.Redirect(w, r, loginURL, http.StatusFound)
+			} else {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
 			}
-			userID = claims.UserID
+			return
+		}
+		userID = claims.UserID
 
-			// Look up VM and verify ownership for non-UI paths
-			vm, err := h.vms.LookupByCustomerID(customerID)
-			if err != nil {
-				slog.Error("vm lookup failed", "error", err, "customer_id", customerID)
-				http.Error(w, "internal error", http.StatusInternalServerError)
-				return
-			}
-			if vm == nil {
-				http.Error(w, "no VM assigned", http.StatusNotFound)
-				return
-			}
-			if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
-				slog.Warn("http proxy forbidden",
-					"vm_user_id", vm.UserID, "email", claims.Email, "customer_id", customerID)
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
+		// Look up VM and verify ownership
+		vm, err := h.vms.LookupByCustomerID(customerID)
+		if err != nil {
+			slog.Error("vm lookup failed", "error", err, "customer_id", customerID)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if vm == nil {
+			http.Error(w, "no VM assigned", http.StatusNotFound)
+			return
+		}
+		if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+			slog.Warn("http proxy forbidden",
+				"vm_user_id", vm.UserID, "email", claims.Email, "customer_id", customerID)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 	}
 
@@ -770,7 +787,8 @@ func addCacheHeaders(resp *http.Response) {
 }
 
 // HandleAuthCallback handles GET /vm/{cid}/auth/callback?session=TOKEN.
-// Validates the session token, sets the evaos_session cookie, and redirects to /vm/{cid}/ui/.
+// H-1 fix: The token in the URL is now a short-lived callback token (30s, single-use).
+// It gets exchanged for the real session token which is set as a cookie.
 func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
@@ -783,15 +801,16 @@ func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionToken := r.URL.Query().Get("session")
-	if sessionToken == "" {
+	callbackToken := r.URL.Query().Get("session")
+	if callbackToken == "" {
 		http.Error(w, "missing session parameter", http.StatusBadRequest)
 		return
 	}
 
-	claims, err := h.sessions.ValidateSessionToken(sessionToken)
+	// H-1: Exchange the short-lived callback token for a real session token
+	sessionToken, claims, err := h.sessions.ExchangeCallbackToken(callbackToken)
 	if err != nil {
-		slog.Info("auth callback: invalid session token",
+		slog.Info("auth callback: invalid callback token",
 			"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -808,7 +827,7 @@ func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set session cookie
+	// Set the real session cookie
 	h.sessions.SetSessionCookie(w, sessionToken)
 
 	// Redirect to the UI
@@ -827,7 +846,7 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// CORS headers for dashboard cross-origin requests
-	h.setAuthSessionCORSHeaders(w)
+	h.setAuthSessionCORSHeaders(w, r)
 
 	if h.sessions == nil {
 		http.Error(w, "session auth not configured", http.StatusServiceUnavailable)
@@ -874,38 +893,66 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 	}
 	roles = append(roles, "customer")
 
-	// Generate proxy session token
-	sessionToken, err := h.sessions.GenerateSessionToken(SessionClaims{
+	// H-1: Generate a short-lived callback token (30s, single-use) instead of the real session token.
+	// The real session token is stored server-side and exchanged at /auth/callback.
+	sessionClaims := SessionClaims{
 		UserID:     claims.UserID,
 		Email:      claims.Email,
 		Roles:      roles,
 		CustomerID: customerID,
-	})
+	}
+
+	callbackToken, err := h.sessions.GenerateCallbackToken(sessionClaims)
 	if err != nil {
-		slog.Error("auth session: token generation failed", "error", err)
+		slog.Error("auth session: callback token generation failed", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	redirectURL := fmt.Sprintf("/vm/%s/auth/callback?session=%s",
-		url.PathEscape(customerID), url.QueryEscape(sessionToken))
+		url.PathEscape(customerID), url.QueryEscape(callbackToken))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"session_token": sessionToken,
-		"redirect_url":  redirectURL,
+		"redirect_url": redirectURL,
 	})
 }
 
 // HandleAuthSessionCORS handles OPTIONS preflight for /vm/{cid}/auth/session.
 func (h *Handler) HandleAuthSessionCORS(w http.ResponseWriter, r *http.Request) {
-	h.setAuthSessionCORSHeaders(w)
+	h.setAuthSessionCORSHeaders(w, r)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// HandleLogout handles GET /vm/{cid}/auth/logout.
+// H-3: Clears the session cookie and redirects to login page.
+func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	customerID := extractCustomerID(r.URL.Path)
+	if customerID == "" || !customerIDPattern.MatchString(customerID) {
+		http.Error(w, "invalid customer_id", http.StatusBadRequest)
+		return
+	}
+
+	if h.sessions != nil {
+		h.sessions.ClearSessionCookie(w)
+	}
+
+	loginURL := fmt.Sprintf("https://www.electricsheephq.com/login?redirect=/vm/%s/ui/",
+		url.PathEscape(customerID))
+	http.Redirect(w, r, loginURL, http.StatusFound)
+}
+
 // setAuthSessionCORSHeaders sets CORS headers for the auth/session endpoint.
-func (h *Handler) setAuthSessionCORSHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "https://www.electricsheephq.com")
+// L-3 fix: validates origin against allowedOrigins map instead of hardcoding.
+func (h *Handler) setAuthSessionCORSHeaders(w http.ResponseWriter, r ...* http.Request) {
+	origin := "https://www.electricsheephq.com" // default
+	if len(r) > 0 && r[0] != nil {
+		reqOrigin := r[0].Header.Get("Origin")
+		if allowedOrigins[reqOrigin] {
+			origin = reqOrigin
+		}
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Max-Age", "3600")
