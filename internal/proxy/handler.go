@@ -710,13 +710,18 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
 
-			// Inject gateway token if available
+			// Remove browser auth headers before injecting gateway credentials
+			req.Header.Del("Authorization")
+			req.Header.Del("Cookie")
+
+			// Inject gateway token as Authorization: Bearer for plugins
+			// registered with auth: "gateway" (e.g. file-browser at /ui/agent-files/).
+			// The proxy has already authenticated the user via Supabase JWT/session,
+			// so injecting the gateway token is safe and maintains defense-in-depth.
 			if token := vm.EffectiveToken(); token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
 				req.Header.Set("X-OpenClaw-Token", token)
 			}
-
-			// Remove hop-by-hop headers
-			req.Header.Del("Authorization")
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// Add cache headers based on content type

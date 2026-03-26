@@ -1000,9 +1000,11 @@ func TestHandleHTTPProxy_ForwardsRequest(t *testing.T) {
 	if got := receivedHeaders.Get("X-Openclaw-Token"); got != "gw-secret" {
 		t.Errorf("X-OpenClaw-Token = %q, want 'gw-secret'", got)
 	}
-	// Auth header should be stripped (don't leak JWT to backend)
-	if got := receivedHeaders.Get("Authorization"); got != "" {
-		t.Errorf("Authorization header should be stripped, got %q", got)
+	// Auth header should contain the gateway token (not the browser JWT).
+	// The proxy strips the browser's JWT and injects the gateway token for
+	// plugins registered with auth: "gateway".
+	if got := receivedHeaders.Get("Authorization"); got != "Bearer gw-secret" {
+		t.Errorf("Authorization = %q, want 'Bearer gw-secret'", got)
 	}
 }
 
