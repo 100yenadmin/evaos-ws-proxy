@@ -183,6 +183,21 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !authedViaSessionWS {
+		// Also check for session token in query param (used by Chrome extension)
+		if h.sessions != nil {
+			if sessionParam := r.URL.Query().Get("session"); sessionParam != "" {
+				if sessionClaims, err := h.sessions.ValidateSessionToken(sessionParam); err == nil {
+					claims = &auth.Claims{
+						UserID: sessionClaims.UserID,
+						Email:  sessionClaims.Email,
+					}
+					authedViaSessionWS = true
+				}
+			}
+		}
+	}
+
+	if !authedViaSessionWS {
 		// Require Supabase JWT for ALL WS connections without session cookie
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
