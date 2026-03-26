@@ -60,6 +60,7 @@ type HandlerConfig struct {
 	JWTValidator      JWTValidator
 	VMRegistry        VMRegistry
 	Health            *health.Handler
+	RestartManager    *RestartManager
 	AdminEmails       []string
 	ConnectTimeout    time.Duration
 	ReconnectAttempts int
@@ -72,6 +73,7 @@ type Handler struct {
 	jwt               JWTValidator
 	vms               VMRegistry
 	health            *health.Handler
+	restarts          *RestartManager
 	adminEmails       map[string]bool
 	connectTimeout    time.Duration
 	reconnectAttempts int
@@ -90,10 +92,15 @@ func NewHandler(cfg HandlerConfig) *Handler {
 	if maxPerUser <= 0 {
 		maxPerUser = 10 // default
 	}
+	restarts := cfg.RestartManager
+	if restarts == nil {
+		restarts = NewRestartManager()
+	}
 	return &Handler{
 		jwt:               cfg.JWTValidator,
 		vms:               cfg.VMRegistry,
 		health:            cfg.Health,
+		restarts:          restarts,
 		adminEmails:       adminSet,
 		connectTimeout:    cfg.ConnectTimeout,
 		reconnectAttempts: cfg.ReconnectAttempts,
@@ -212,11 +219,20 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
 		logger.Error("vm lookup failed", "error", err)
+		// For UI WS paths, try to show maintenance page if not upgraded yet
+		if isUIWS {
+			h.serveMaintenancePage(w, customerID, ReasonNetworkError)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if vm == nil {
 		logger.Info("no active VM for customer")
+		if isUIWS {
+			h.serveMaintenancePage(w, customerID, ReasonNotProvisioned)
+			return
+		}
 		http.Error(w, "no VM assigned", http.StatusNotFound)
 		return
 	}
@@ -439,13 +455,28 @@ func isWebSocketUpgrade(r *http.Request) bool {
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-// ServeHTTP dispatches between WebSocket upgrades and regular HTTP proxy requests.
+// ServeHTTP dispatches between WebSocket upgrades, API endpoints, and HTTP proxy.
 // Register this on the mux instead of HandleWebSocket directly.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isWebSocketUpgrade(r) {
 		h.HandleWebSocket(w, r)
 		return
 	}
+
+	// Route API endpoints before the general proxy handler
+	customerID := extractCustomerID(r.URL.Path)
+	if customerID != "" {
+		backendPath := stripVMPrefix(r.URL.Path, customerID)
+		switch {
+		case backendPath == "/restart" && r.Method == http.MethodPost:
+			h.HandleRestart(w, r)
+			return
+		case backendPath == "/health-check" && r.Method == http.MethodGet:
+			h.HandleHealthCheck(w, r)
+			return
+		}
+	}
+
 	h.HandleHTTPProxy(w, r)
 }
 
@@ -518,10 +549,18 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
 		logger.Error("vm lookup failed", "error", err)
+		if isUIPath {
+			h.serveMaintenancePage(w, customerID, ReasonNetworkError)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if vm == nil {
+		if isUIPath {
+			h.serveMaintenancePage(w, customerID, ReasonNotProvisioned)
+			return
+		}
 		http.Error(w, "no VM assigned", http.StatusNotFound)
 		return
 	}
@@ -579,6 +618,11 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.Error("http proxy backend error", "error", err)
+			if isUIPath {
+				reason := classifyBackendError(err)
+				h.serveMaintenancePage(w, customerID, reason)
+				return
+			}
 			http.Error(w, "backend unavailable", http.StatusBadGateway)
 		},
 		Transport: &http.Transport{
