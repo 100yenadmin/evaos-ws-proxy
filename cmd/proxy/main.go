@@ -93,10 +93,20 @@ func main() {
 	vmRegistry := registry.NewSupabaseRegistry(appCtx, cfg.SupabaseURL, cfg.SupabaseServiceKey, cfg.VMCacheTTL)
 	healthHandler := health.NewHandler()
 
+	// Session manager for cookie-based auth (uses JWT secret as HMAC key)
+	var sessionMgr *proxy.SessionManager
+	if cfg.SupabaseJWTSecret != "" {
+		sessionMgr = proxy.NewSessionManager([]byte(cfg.SupabaseJWTSecret))
+		slog.Info("session auth enabled")
+	} else {
+		slog.Warn("session auth disabled — SUPABASE_JWT_SECRET not set")
+	}
+
 	proxyHandler := proxy.NewHandler(proxy.HandlerConfig{
 		JWTValidator:      jwtValidator,
 		VMRegistry:        vmRegistry,
 		Health:            healthHandler,
+		SessionManager:    sessionMgr,
 		AdminEmails:       cfg.AdminEmails,
 		ConnectTimeout:    cfg.BackendConnectTimeout,
 		ReconnectAttempts: cfg.BackendReconnectAttempts,

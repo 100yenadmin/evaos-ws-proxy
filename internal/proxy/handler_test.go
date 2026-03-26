@@ -1634,3 +1634,404 @@ func TestConnectBackend_AllRetriesFail(t *testing.T) {
 		t.Errorf("expected error to mention attempts, got: %v", err)
 	}
 }
+
+// --- Session auth tests ---
+
+func newTestHandlerWithSessions(jwt JWTValidator, vms VMRegistry, secret string, opts ...func(*HandlerConfig)) *Handler {
+	sm := NewSessionManager([]byte(secret))
+	cfg := HandlerConfig{
+		JWTValidator:   jwt,
+		VMRegistry:     vms,
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		ConnectTimeout: 5 * time.Second,
+		SessionManager: sm,
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return NewHandler(cfg)
+}
+
+func TestHandleHTTPProxy_SessionCookie_ValidOwner(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	// Create a valid session token for user-1
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID:     "user-1",
+		Email:      "test@test.com",
+		CustomerID: "cust-1",
+	})
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr(backendHost),
+			GatewayPort: backendPort,
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_SessionCookie_AdminAccess(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "admin-user",
+		Email:  "admin@100yen.org",
+		Roles:  []string{"admin"},
+	})
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	backendAddr := strings.TrimPrefix(backendServer.URL, "http://")
+	parts := strings.Split(backendAddr, ":")
+	backendHost := parts[0]
+	var backendPort int
+	fmt.Sscanf(parts[1], "%d", &backendPort)
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "other-user",
+			TailnetIP:   strPtr(backendHost),
+			GatewayPort: backendPort,
+		}},
+		secret,
+		func(cfg *HandlerConfig) {
+			cfg.AdminEmails = []string{"admin@100yen.org"}
+		},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for admin, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_SessionCookie_WrongUser(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-wrong",
+		Email:  "wrong@example.com",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-owner",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestHandleHTTPProxy_NoAuth_UIPath_FallsThrough(t *testing.T) {
+	// Without session manager, UI path still skips auth (backward compat)
+	h := newTestHandler(
+		&mockJWT{},
+		&mockRegistry{vm: nil},
+	)
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/index.html", nil)
+	w := httptest.NewRecorder()
+	h.HandleHTTPProxy(w, req)
+	// Should get maintenance page (no VM), not 401
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 (maintenance), got %d", w.Code)
+	}
+}
+
+func TestHandleAuthCallback_ValidSession(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+token, nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthCallback(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 redirect, got %d", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	if loc != "/vm/cust-1/ui/" {
+		t.Errorf("Location = %q, want /vm/cust-1/ui/", loc)
+	}
+	// Verify cookie was set
+	cookies := w.Result().Cookies()
+	var found bool
+	for _, c := range cookies {
+		if c.Name == "evaos_session" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected evaos_session cookie to be set")
+	}
+}
+
+func TestHandleAuthCallback_InvalidSession(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+		}},
+		"test-secret",
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session=invalid.token.here", nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthCallback(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHandleAuthCallback_MissingSession(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{},
+		"test-secret",
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback", nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthCallback(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleAuthCallback_Forbidden(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-wrong",
+		Email:  "wrong@example.com",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-owner",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+token, nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthCallback(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestHandleAuthSession_ValidJWT(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		"test-session-secret",
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/auth/session", nil)
+	req.Header.Set("Authorization", "Bearer valid-jwt")
+	w := httptest.NewRecorder()
+	h.HandleAuthSession(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["session_token"] == "" {
+		t.Error("expected non-empty session_token")
+	}
+	if resp["redirect_url"] == "" {
+		t.Error("expected non-empty redirect_url")
+	}
+	if !strings.Contains(resp["redirect_url"], "/auth/callback") {
+		t.Errorf("redirect_url should contain /auth/callback, got %q", resp["redirect_url"])
+	}
+
+	// Verify CORS headers
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://www.electricsheephq.com" {
+		t.Errorf("CORS origin = %q, want https://www.electricsheephq.com", got)
+	}
+}
+
+func TestHandleAuthSession_NoJWT(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{},
+		"test-secret",
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/auth/session", nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthSession(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHandleAuthSession_Forbidden(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{claims: &auth.Claims{UserID: "user-wrong", Email: "hacker@evil.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-owner",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		"test-secret",
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/auth/session", nil)
+	req.Header.Set("Authorization", "Bearer valid-jwt")
+	w := httptest.NewRecorder()
+	h.HandleAuthSession(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestHandleAuthSessionCORS_Preflight(t *testing.T) {
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{},
+		"test-secret",
+	)
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	req, _ := http.NewRequest("OPTIONS", server.URL+"/vm/cust-1/auth/session", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://www.electricsheephq.com" {
+		t.Errorf("CORS origin = %q, want https://www.electricsheephq.com", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
+		t.Errorf("CORS methods = %q, want POST", got)
+	}
+}
+
+func TestServeHTTP_RoutesToAuthCallback(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID: "user-1",
+		Email:  "test@test.com",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID: "cust-1",
+			UserID:     "user-1",
+			TailnetIP:  strPtr("127.0.0.1"),
+		}},
+		secret,
+	)
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	// Don't follow redirects
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	resp, err := client.Get(server.URL + "/vm/cust-1/auth/callback?session=" + token)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302, got %d", resp.StatusCode)
+	}
+}

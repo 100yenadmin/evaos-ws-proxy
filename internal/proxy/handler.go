@@ -62,6 +62,7 @@ type HandlerConfig struct {
 	Health            *health.Handler
 	RestartManager    *RestartManager
 	Diagnostics       DiagnosticsRunner
+	SessionManager    *SessionManager
 	AdminEmails       []string
 	ConnectTimeout    time.Duration
 	ReconnectAttempts int
@@ -76,6 +77,7 @@ type Handler struct {
 	health            *health.Handler
 	restarts          *RestartManager
 	diagnostics       DiagnosticsRunner
+	sessions          *SessionManager
 	adminEmails       map[string]bool
 	connectTimeout    time.Duration
 	reconnectAttempts int
@@ -104,6 +106,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		health:            cfg.Health,
 		restarts:          restarts,
 		diagnostics:       cfg.Diagnostics,
+		sessions:          cfg.SessionManager,
 		adminEmails:       adminSet,
 		connectTimeout:    cfg.ConnectTimeout,
 		reconnectAttempts: cfg.ReconnectAttempts,
@@ -165,7 +168,22 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	isUIWS := strings.HasPrefix(backendPathWS, "/ui")
 
 	var claims *auth.Claims
-	if !isUIWS {
+	var authedViaSessionWS bool
+
+	// Check session cookie first (works for both UI and non-UI WS)
+	if h.sessions != nil {
+		if sessionToken := GetSessionCookie(r); sessionToken != "" {
+			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
+				claims = &auth.Claims{
+					UserID: sessionClaims.UserID,
+					Email:  sessionClaims.Email,
+				}
+				authedViaSessionWS = true
+			}
+		}
+	}
+
+	if !authedViaSessionWS && !isUIWS {
 		// Non-UI WS: require Supabase JWT (dashboard/API connections)
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
@@ -471,6 +489,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if customerID != "" {
 		backendPath := stripVMPrefix(r.URL.Path, customerID)
 		switch {
+		case backendPath == "/auth/callback":
+			h.HandleAuthCallback(w, r)
+			return
+		case backendPath == "/auth/session" && r.Method == http.MethodPost:
+			h.HandleAuthSession(w, r)
+			return
+		case backendPath == "/auth/session" && r.Method == http.MethodOptions:
+			h.HandleAuthSessionCORS(w, r)
+			return
 		case backendPath == "/restart" && r.Method == http.MethodPost:
 			h.HandleRestart(w, r)
 			return
@@ -515,40 +542,69 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	isUIPath := strings.HasPrefix(backendPath, "/ui")
 
 	var userID string
+	var authedViaSession bool
 
-	// UI static assets don't require JWT — the WS connection is the auth boundary.
-	// Other HTTP endpoints still require Supabase JWT auth.
-	if !isUIPath {
-		tokenStr := extractToken(r)
-		if tokenStr == "" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+	// Auth strategy:
+	// 1. Check evaos_session cookie first (fast path for repeat visits)
+	// 2. Fall back to Authorization header / query param JWT
+	// 3. UI paths: redirect to login if no auth; non-UI paths: 401
+	if h.sessions != nil {
+		if sessionToken := GetSessionCookie(r); sessionToken != "" {
+			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
+				// Valid session — verify ownership/admin
+				vm, err := h.vms.LookupByCustomerID(customerID)
+				if err == nil && vm != nil {
+					if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
+						userID = sessionClaims.UserID
+						authedViaSession = true
+						// Renew cookie if close to expiry
+						if h.sessions.ShouldRenew(sessionClaims) {
+							if renewed, err := h.sessions.RenewSessionToken(sessionClaims); err == nil {
+								h.sessions.SetSessionCookie(w, renewed)
+							}
+						}
+					} else {
+						http.Error(w, "forbidden", http.StatusForbidden)
+						return
+					}
+				}
+			}
 		}
-		claims, err := h.jwt.Validate(tokenStr)
-		if err != nil {
-			slog.Info("http proxy auth failed",
-				"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		userID = claims.UserID
+	}
 
-		// Look up VM and verify ownership for non-UI paths
-		vm, err := h.vms.LookupByCustomerID(customerID)
-		if err != nil {
-			slog.Error("vm lookup failed", "error", err, "customer_id", customerID)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		if vm == nil {
-			http.Error(w, "no VM assigned", http.StatusNotFound)
-			return
-		}
-		if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
-			slog.Warn("http proxy forbidden",
-				"vm_user_id", vm.UserID, "email", claims.Email, "customer_id", customerID)
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
+	if !authedViaSession {
+		if !isUIPath {
+			tokenStr := extractToken(r)
+			if tokenStr == "" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			claims, err := h.jwt.Validate(tokenStr)
+			if err != nil {
+				slog.Info("http proxy auth failed",
+					"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			userID = claims.UserID
+
+			// Look up VM and verify ownership for non-UI paths
+			vm, err := h.vms.LookupByCustomerID(customerID)
+			if err != nil {
+				slog.Error("vm lookup failed", "error", err, "customer_id", customerID)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			if vm == nil {
+				http.Error(w, "no VM assigned", http.StatusNotFound)
+				return
+			}
+			if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+				slog.Warn("http proxy forbidden",
+					"vm_user_id", vm.UserID, "email", claims.Email, "customer_id", customerID)
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
 		}
 	}
 
@@ -711,6 +767,154 @@ func addCacheHeaders(resp *http.Response) {
 		// Other types: short cache
 		resp.Header.Set("Cache-Control", "public, max-age=300")
 	}
+}
+
+// HandleAuthCallback handles GET /vm/{cid}/auth/callback?session=TOKEN.
+// Validates the session token, sets the evaos_session cookie, and redirects to /vm/{cid}/ui/.
+func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	customerID := extractCustomerID(r.URL.Path)
+	if customerID == "" || !customerIDPattern.MatchString(customerID) {
+		http.Error(w, "invalid customer_id", http.StatusBadRequest)
+		return
+	}
+
+	if h.sessions == nil {
+		http.Error(w, "session auth not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	sessionToken := r.URL.Query().Get("session")
+	if sessionToken == "" {
+		http.Error(w, "missing session parameter", http.StatusBadRequest)
+		return
+	}
+
+	claims, err := h.sessions.ValidateSessionToken(sessionToken)
+	if err != nil {
+		slog.Info("auth callback: invalid session token",
+			"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify ownership/admin for this customer
+	vm, err := h.vms.LookupByCustomerID(customerID)
+	if err != nil || vm == nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	if claims.UserID != vm.UserID && !h.isAdmin(claims.Email) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Set session cookie
+	h.sessions.SetSessionCookie(w, sessionToken)
+
+	// Redirect to the UI
+	redirectURL := fmt.Sprintf("/vm/%s/ui/", url.PathEscape(customerID))
+	http.Redirect(w, r, redirectURL, http.StatusFound)
+}
+
+// HandleAuthSession handles POST /vm/{cid}/auth/session.
+// Takes a Supabase JWT via Authorization header, validates it, looks up VM ownership,
+// and returns a proxy session token + redirect URL.
+func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
+	customerID := extractCustomerID(r.URL.Path)
+	if customerID == "" || !customerIDPattern.MatchString(customerID) {
+		http.Error(w, "invalid customer_id", http.StatusBadRequest)
+		return
+	}
+
+	// CORS headers for dashboard cross-origin requests
+	h.setAuthSessionCORSHeaders(w)
+
+	if h.sessions == nil {
+		http.Error(w, "session auth not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Extract and validate Supabase JWT
+	tokenStr := extractToken(r)
+	if tokenStr == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	claims, err := h.jwt.Validate(tokenStr)
+	if err != nil {
+		slog.Info("auth session: invalid JWT",
+			"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Look up VM ownership
+	vm, err := h.vms.LookupByCustomerID(customerID)
+	if err != nil {
+		slog.Error("auth session: vm lookup failed", "error", err, "customer_id", customerID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if vm == nil {
+		http.Error(w, "no VM assigned", http.StatusNotFound)
+		return
+	}
+
+	// Verify ownership or admin
+	if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Build roles
+	var roles []string
+	if h.isAdmin(claims.Email) {
+		roles = append(roles, "admin")
+	}
+	roles = append(roles, "customer")
+
+	// Generate proxy session token
+	sessionToken, err := h.sessions.GenerateSessionToken(SessionClaims{
+		UserID:     claims.UserID,
+		Email:      claims.Email,
+		Roles:      roles,
+		CustomerID: customerID,
+	})
+	if err != nil {
+		slog.Error("auth session: token generation failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	redirectURL := fmt.Sprintf("/vm/%s/auth/callback?session=%s",
+		url.PathEscape(customerID), url.QueryEscape(sessionToken))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"session_token": sessionToken,
+		"redirect_url":  redirectURL,
+	})
+}
+
+// HandleAuthSessionCORS handles OPTIONS preflight for /vm/{cid}/auth/session.
+func (h *Handler) HandleAuthSessionCORS(w http.ResponseWriter, r *http.Request) {
+	h.setAuthSessionCORSHeaders(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// setAuthSessionCORSHeaders sets CORS headers for the auth/session endpoint.
+func (h *Handler) setAuthSessionCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "https://www.electricsheephq.com")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Max-Age", "3600")
+}
+
+// isAdminEmail checks if an email is in the admin list.
+// Convenience wrapper that accepts a plain email string.
+func (h *Handler) isAdminEmail(email string) bool {
+	return h.isAdmin(email)
 }
 
 // Ensure Handler implements http.Handler (used for the combined WS+HTTP route).
