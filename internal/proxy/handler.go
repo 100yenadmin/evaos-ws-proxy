@@ -84,6 +84,7 @@ type Handler struct {
 	maxConnections    int
 	maxPerUser        int
 	userConns         sync.Map // map[string]*atomic.Int64
+	httpTransport     *http.Transport // shared transport for reverse proxies
 }
 
 // NewHandler creates a new proxy handler.
@@ -112,6 +113,12 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		reconnectAttempts: cfg.ReconnectAttempts,
 		maxConnections:    cfg.MaxConnections,
 		maxPerUser:        maxPerUser,
+		httpTransport: &http.Transport{
+			ResponseHeaderTimeout: cfg.ConnectTimeout,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+		},
 	}
 }
 
@@ -734,9 +741,7 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			http.Error(w, "backend unavailable", http.StatusBadGateway)
 		},
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: h.connectTimeout,
-		},
+		Transport: h.httpTransport,
 	}
 
 	proxy.ServeHTTP(w, r)

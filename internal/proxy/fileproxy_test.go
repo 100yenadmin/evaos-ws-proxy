@@ -263,6 +263,33 @@ func TestServeHTTP_FilesPathNotConfusedWithUI(t *testing.T) {
 	}
 }
 
+func TestHandleFileProxy_PathTraversal(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999,
+		}},
+	)
+
+	// Simulate URL-encoded dot traversal (path.Clean resolves these)
+	traversalPaths := []string{
+		"/vm/cust-1/files/../../etc/passwd",
+		"/vm/cust-1/files/../../../etc/shadow",
+	}
+	for _, p := range traversalPaths {
+		req := httptest.NewRequest("GET", p, nil)
+		req.Header.Set("Authorization", "Bearer valid-token")
+		w := httptest.NewRecorder()
+		h.HandleFileProxy(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("path %q: expected 400, got %d", p, w.Code)
+		}
+	}
+}
+
 func TestHandleFileProxy_HeadMethod(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},

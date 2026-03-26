@@ -6,7 +6,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
+	"strings"
 )
+
+// maxAudioBodySize limits multipart STT uploads to 25MB (matches OpenAI's limit).
+const maxAudioBodySize = 25 << 20 // 25 MiB
 
 const speachesPort = 8000
 
@@ -23,6 +28,11 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodOptions {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Limit request body size to prevent abuse (25MB matches OpenAI's audio upload limit)
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAudioBodySize)
 	}
 
 	customerID := extractCustomerID(r.URL.Path)
@@ -119,7 +129,12 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 
 	// --- Build backend path ---
 	// Strip /vm/{customer_id}, keep /v1/audio/* intact
-	backendPath := stripVMPrefix(r.URL.Path, customerID)
+	backendPath := path.Clean(stripVMPrefix(r.URL.Path, customerID))
+	// Verify the cleaned path still starts with /v1/audio/ to prevent traversal escape
+	if !strings.HasPrefix(backendPath, "/v1/audio/") {
+		http.Error(w, "invalid audio path", http.StatusBadRequest)
+		return
+	}
 
 	logger := slog.With(
 		"user_id", userID,
@@ -165,9 +180,7 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 		},
 		// No FlushInterval needed — audio responses are typically complete before sending.
 		// For streaming TTS, we'd add FlushInterval: -1, but Speaches buffers.
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: h.connectTimeout,
-		},
+		Transport: h.httpTransport,
 	}
 
 	proxy.ServeHTTP(w, r)

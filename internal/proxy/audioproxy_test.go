@@ -165,6 +165,53 @@ func TestHandleAudioProxy_MissingCustomerID(t *testing.T) {
 	}
 }
 
+func TestHandleAudioProxy_CustomerIsolation(t *testing.T) {
+	// Customer A's JWT should NOT be able to access Customer B's VM
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-A", Email: "a@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-B",
+			UserID:      "user-B", // Different user owns this VM
+			TailnetIP:   strPtr("100.64.0.2"),
+			GatewayPort: 59999,
+		}},
+	)
+	req := httptest.NewRequest("POST", "/vm/cust-B/v1/audio/transcriptions", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	w := httptest.NewRecorder()
+	h.HandleAudioProxy(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-customer access, got %d", w.Code)
+	}
+}
+
+func TestHandleAudioProxy_PathTraversal(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999,
+		}},
+	)
+
+	// Path traversal attempts via the audio route
+	traversalPaths := []string{
+		"/vm/cust-1/v1/audio/../../etc/passwd",
+		"/vm/cust-1/v1/audio/../../../etc/shadow",
+	}
+	for _, p := range traversalPaths {
+		req := httptest.NewRequest("POST", p, nil)
+		req.Header.Set("Authorization", "Bearer valid-token")
+		w := httptest.NewRecorder()
+		h.HandleAudioProxy(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("path %q: expected 400, got %d", p, w.Code)
+		}
+	}
+}
+
 // --- Integration test: verify audio proxy forwards correctly ---
 
 func TestHandleAudioProxy_ForwardsSTT(t *testing.T) {

@@ -6,10 +6,14 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 )
 
 const fileServerPort = 8890
+
+// maxFileBodySize limits file uploads through the proxy to 100MB.
+const maxFileBodySize = 100 << 20 // 100 MiB
 
 // HandleFileProxy serves files from a customer's VM file server (port 8890).
 // Route: /vm/{customer_id}/files/{path...}
@@ -18,6 +22,11 @@ const fileServerPort = 8890
 func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	// File Browser uses GET, HEAD, POST, PUT, PATCH, DELETE for its full UI.
 	// Allow all standard methods.
+
+	// Limit request body size for mutating methods to prevent abuse
+	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+		r.Body = http.MaxBytesReader(w, r.Body, maxFileBodySize)
+	}
 
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
@@ -102,10 +111,17 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	// Strip /vm/{customer_id} prefix, keep /files/* intact.
 	// File Browser is configured with baseurl=/files, so it expects /files/... paths.
 	backendPath := stripVMPrefix(r.URL.Path, customerID)
+	// Clean the path to prevent traversal via encoded dots (%2e%2e)
+	backendPath = path.Clean(backendPath)
 	// backendPath is now "/files/..." — pass it through as-is.
 	filePath := backendPath
-	if filePath == "" {
+	if filePath == "" || filePath == "." {
 		filePath = "/files/"
+	}
+	// Verify the cleaned path still starts with /files to prevent traversal escape
+	if !strings.HasPrefix(filePath, "/files") {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
 	}
 
 	logger := slog.With(
@@ -162,9 +178,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 			logger.Error("file proxy backend error", "error", err)
 			http.Error(w, "file server unavailable", http.StatusBadGateway)
 		},
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: h.connectTimeout,
-		},
+		Transport: h.httpTransport,
 	}
 
 	proxy.ServeHTTP(w, r)
