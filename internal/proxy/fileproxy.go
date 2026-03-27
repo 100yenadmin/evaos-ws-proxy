@@ -97,12 +97,25 @@ func bootstrapFilegatorSession(vmIP, customerID string) (*filegatorSession, erro
 }
 
 func mapFilegatorPath(fullPath, customerID string) string {
+	// Try /vm/{customerID}/files... first (direct access, no Traefik strip)
 	prefix := "/vm/" + customerID + "/files"
-	stripped := strings.TrimPrefix(fullPath, prefix)
-	if stripped == "" || stripped == "/" {
-		return "/"
+	if strings.HasPrefix(fullPath, prefix) {
+		stripped := strings.TrimPrefix(fullPath, prefix)
+		if stripped == "" || stripped == "/" {
+			return "/"
+		}
+		return stripped
 	}
-	return stripped
+	// Try /{customerID}/files... (Traefik stripped /vm prefix before forwarding)
+	prefix = "/" + customerID + "/files"
+	if strings.HasPrefix(fullPath, prefix) {
+		stripped := strings.TrimPrefix(fullPath, prefix)
+		if stripped == "" || stripped == "/" {
+			return "/"
+		}
+		return stripped
+	}
+	return fullPath
 }
 
 // HandleFileProxy serves files from a customer's VM via File Browser (filebrowser.org).
