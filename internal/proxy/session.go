@@ -272,7 +272,7 @@ func (sm *SessionManager) SetSessionCookie(w http.ResponseWriter, token string) 
 		MaxAge:   int(sessionMaxAge.Seconds()),
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteNoneMode, // None required for iframe sub-resource loads
 	})
 }
 
@@ -286,7 +286,7 @@ func (sm *SessionManager) ClearSessionCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteNoneMode,
 	})
 }
 

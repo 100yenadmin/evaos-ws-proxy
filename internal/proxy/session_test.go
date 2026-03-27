@@ -151,8 +151,8 @@ func TestSessionManager_SetAndGetCookie(t *testing.T) {
 	if !found.Secure {
 		t.Error("cookie should be Secure")
 	}
-	if found.SameSite != http.SameSiteLaxMode {
-		t.Error("cookie should be SameSite=Lax")
+	if found.SameSite != http.SameSiteNoneMode {
+		t.Error("cookie should be SameSite=None")
 	}
 	// M-1: Cookie domain scoped to ecs.electricsheephq.com
 	expectedDomain := "ecs.electricsheephq.com"
