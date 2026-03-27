@@ -15,13 +15,24 @@ const maxAudioBodySize = 25 << 20 // 25 MiB
 
 const speachesPort = 8000
 
+// isAllowedAudioOrigin returns true for known dashboard origins and Chrome extension origins.
+func isAllowedAudioOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	if allowedOrigins[origin] {
+		return true
+	}
+	return strings.HasPrefix(origin, "chrome-extension://")
+}
+
 // HandleAudioProxy proxies OpenAI-compatible audio API requests to Speaches on the VM.
 // Route: /vm/{customer_id}/v1/audio/{endpoint}
 // Supported endpoints:
 //   - POST /v1/audio/transcriptions (STT — multipart/form-data with audio file)
 //   - POST /v1/audio/speech (TTS — JSON body, returns audio bytes)
 //
-// Auth: Supabase JWT or session cookie (same as other authenticated routes).
+// Auth: session cookie, gateway token, or Supabase JWT.
 // The /vm/{customer_id} prefix is stripped; /v1/audio/* is kept intact.
 func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 	// Allow POST (main usage) and OPTIONS (CORS preflight)
@@ -44,7 +55,7 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 	// Handle CORS preflight
 	if r.Method == http.MethodOptions {
 		origin := r.Header.Get("Origin")
-		if origin != "" && allowedOrigins[origin] {
+		if isAllowedAudioOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -54,7 +65,19 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Auth (identical to file proxy) ---
+	// Resolve the VM up front so we can validate either JWT ownership or direct gateway-token auth.
+	vm, err := h.vms.LookupByCustomerID(customerID)
+	if err != nil {
+		slog.Error("audio proxy vm lookup failed", "error", err, "customer_id", customerID)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if vm == nil {
+		http.Error(w, "no VM assigned", http.StatusNotFound)
+		return
+	}
+
+	// --- Auth ---
 	var userID string
 	var authedViaSession bool
 
@@ -62,15 +85,12 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 	if h.sessions != nil {
 		if sessionToken := GetSessionCookie(r); sessionToken != "" {
 			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
-				vm, err := h.vms.LookupByCustomerID(customerID)
-				if err == nil && vm != nil {
-					if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
-						userID = sessionClaims.UserID
-						authedViaSession = true
-					} else {
-						http.Error(w, "forbidden", http.StatusForbidden)
-						return
-					}
+				if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
+					userID = sessionClaims.UserID
+					authedViaSession = true
+				} else {
+					http.Error(w, "forbidden", http.StatusForbidden)
+					return
 				}
 				// Renew cookie if close to expiry
 				if authedViaSession && h.sessions.ShouldRenew(sessionClaims) {
@@ -82,49 +102,32 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Fall back to JWT
+	// 2. Fall back to Authorization/query token.
 	if !authedViaSession {
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		claims, err := h.jwt.Validate(tokenStr)
-		if err != nil {
-			slog.Info("audio proxy auth failed",
-				"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		userID = claims.UserID
 
-		// Verify ownership
-		vm, err := h.vms.LookupByCustomerID(customerID)
-		if err != nil {
-			slog.Error("audio proxy vm lookup failed", "error", err, "customer_id", customerID)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		if vm == nil {
-			http.Error(w, "no VM assigned", http.StatusNotFound)
-			return
-		}
-		if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-	}
+		// Chrome extension / direct API usage: accept the VM's gateway token directly.
+		if vm.EffectiveToken() != "" && tokenStr == vm.EffectiveToken() {
+			userID = "gateway:" + customerID
+		} else {
+			claims, err := h.jwt.Validate(tokenStr)
+			if err != nil {
+				slog.Info("audio proxy auth failed",
+					"error", err, "remote_addr", r.RemoteAddr, "customer_id", customerID)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			userID = claims.UserID
 
-	// --- VM lookup ---
-	vm, err := h.vms.LookupByCustomerID(customerID)
-	if err != nil {
-		slog.Error("audio proxy vm lookup failed", "error", err, "customer_id", customerID)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if vm == nil {
-		http.Error(w, "no VM assigned", http.StatusNotFound)
-		return
+			if vm.UserID != claims.UserID && !h.isAdmin(claims.Email) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 	}
 
 	// --- Build backend path ---
@@ -162,14 +165,15 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
 			req.Host = target.Host
 
-			// Don't forward auth headers to the backend
+			// Forwarding metadata only; never leak caller credentials to Speaches.
+			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
+			req.Header.Set("X-Forwarded-Proto", "https")
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// Set CORS headers
 			origin := r.Header.Get("Origin")
-			if origin != "" && allowedOrigins[origin] {
+			if isAllowedAudioOrigin(origin) {
 				resp.Header.Set("Access-Control-Allow-Origin", origin)
 			}
 			return nil
@@ -178,8 +182,6 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 			logger.Error("audio proxy backend error", "error", err)
 			http.Error(w, "audio service unavailable", http.StatusBadGateway)
 		},
-		// No FlushInterval needed — audio responses are typically complete before sending.
-		// For streaming TTS, we'd add FlushInterval: -1, but Speaches buffers.
 		Transport: h.httpTransport,
 	}
 

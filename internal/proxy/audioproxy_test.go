@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/100yenadmin/evaos-ws-proxy/internal/auth"
 	"github.com/100yenadmin/evaos-ws-proxy/internal/registry"
@@ -16,7 +20,7 @@ import (
 // --- Audio Proxy Route Tests ---
 
 func TestHandleAudioProxy_NoAuth(t *testing.T) {
-	h := newTestHandler(&mockJWT{}, &mockRegistry{})
+	h := newTestHandler(&mockJWT{}, &mockRegistry{vm: &registry.VMInfo{CustomerID: "cust-1", UserID: "user-1", TailnetIP: strPtr("127.0.0.1")}})
 	req := httptest.NewRequest("POST", "/vm/cust-1/v1/audio/transcriptions", nil)
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
@@ -28,7 +32,7 @@ func TestHandleAudioProxy_NoAuth(t *testing.T) {
 func TestHandleAudioProxy_InvalidToken(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{err: fmt.Errorf("invalid token")},
-		&mockRegistry{},
+		&mockRegistry{vm: &registry.VMInfo{CustomerID: "cust-1", UserID: "user-1", TailnetIP: strPtr("127.0.0.1")}},
 	)
 	req := httptest.NewRequest("POST", "/vm/cust-1/v1/audio/transcriptions", nil)
 	req.Header.Set("Authorization", "Bearer bad-token")
@@ -73,7 +77,6 @@ func TestHandleAudioProxy_Forbidden(t *testing.T) {
 
 func TestHandleAudioProxy_MethodNotAllowed(t *testing.T) {
 	h := newTestHandler(&mockJWT{}, &mockRegistry{})
-	// GET is not allowed for audio endpoints
 	req := httptest.NewRequest("GET", "/vm/cust-1/v1/audio/transcriptions", nil)
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
@@ -85,14 +88,14 @@ func TestHandleAudioProxy_MethodNotAllowed(t *testing.T) {
 func TestHandleAudioProxy_OptionsPreflightCORS(t *testing.T) {
 	h := newTestHandler(&mockJWT{}, &mockRegistry{})
 	req := httptest.NewRequest("OPTIONS", "/vm/cust-1/v1/audio/transcriptions", nil)
-	req.Header.Set("Origin", "https://ecs.electricsheephq.com")
+	req.Header.Set("Origin", "chrome-extension://abcdefghijklmnop")
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
 	if w.Code != http.StatusNoContent {
 		t.Errorf("expected 204, got %d", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://ecs.electricsheephq.com" {
-		t.Errorf("expected CORS origin header, got %q", got)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "chrome-extension://abcdefghijklmnop" {
+		t.Errorf("expected chrome extension CORS origin header, got %q", got)
 	}
 	if got := w.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
 		t.Errorf("expected POST in allowed methods, got %q", got)
@@ -123,9 +126,30 @@ func TestHandleAudioProxy_SessionAuth(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
 
-	// Should pass auth (will 502 because no Speaches, but NOT 401/403)
 	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
 		t.Errorf("session auth should pass, got %d", w.Code)
+	}
+}
+
+func TestHandleAudioProxy_GatewayTokenAuth(t *testing.T) {
+	h := newTestHandler(
+		&mockJWT{err: fmt.Errorf("should not validate JWT for gateway token")},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "golden",
+			UserID:       "user-owner",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayToken: strPtr("gw-direct-token"),
+		}},
+	)
+
+	req := httptest.NewRequest("POST", "/vm/golden/v1/audio/speech", strings.NewReader(`{"input":"hello","voice":"nova"}`))
+	req.Header.Set("Authorization", "Bearer gw-direct-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.HandleAudioProxy(w, req)
+
+	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+		t.Fatalf("gateway token auth should pass, got %d", w.Code)
 	}
 }
 
@@ -149,7 +173,6 @@ func TestHandleAudioProxy_AdminAccess(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
 
-	// Admin should bypass ownership — should NOT be 403
 	if w.Code == http.StatusForbidden {
 		t.Error("admin should bypass ownership check for audio proxy")
 	}
@@ -166,12 +189,11 @@ func TestHandleAudioProxy_MissingCustomerID(t *testing.T) {
 }
 
 func TestHandleAudioProxy_CustomerIsolation(t *testing.T) {
-	// Customer A's JWT should NOT be able to access Customer B's VM
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-A", Email: "a@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
 			CustomerID:  "cust-B",
-			UserID:      "user-B", // Different user owns this VM
+			UserID:      "user-B",
 			TailnetIP:   strPtr("100.64.0.2"),
 			GatewayPort: 59999,
 		}},
@@ -196,7 +218,6 @@ func TestHandleAudioProxy_PathTraversal(t *testing.T) {
 		}},
 	)
 
-	// Path traversal attempts via the audio route
 	traversalPaths := []string{
 		"/vm/cust-1/v1/audio/../../etc/passwd",
 		"/vm/cust-1/v1/audio/../../../etc/shadow",
@@ -212,79 +233,121 @@ func TestHandleAudioProxy_PathTraversal(t *testing.T) {
 	}
 }
 
-// --- Integration test: verify audio proxy forwards correctly ---
+func startSpeachesTestServer(t *testing.T, handler http.HandlerFunc) func() {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:8000")
+	if err != nil {
+		t.Fatalf("listen 127.0.0.1:8000: %v", err)
+	}
+	server := &http.Server{Handler: handler}
+	go func() { _ = server.Serve(ln) }()
+	return func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}
+}
 
-func TestHandleAudioProxy_ForwardsSTT(t *testing.T) {
+// --- Integration tests: verify audio proxy forwards correctly ---
+
+func TestHandleAudioProxy_ForwardsSTTMultipart(t *testing.T) {
 	var receivedPath string
 	var receivedContentType string
+	var receivedBody []byte
+	var receivedAuth string
 
-	// Mock Speaches server
-	audioServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cleanup := startSpeachesTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedPath = r.URL.Path
 		receivedContentType = r.Header.Get("Content-Type")
+		receivedAuth = r.Header.Get("Authorization")
+		receivedBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"text":"hello world"}`))
+		_, _ = w.Write([]byte(`{"text":"hello world"}`))
 	}))
-	defer audioServer.Close()
+	defer cleanup()
 
-	backendAddr := strings.TrimPrefix(audioServer.URL, "http://")
-	parts := strings.Split(backendAddr, ":")
-	backendHost := parts[0]
-	var backendPort int
-	fmt.Sscanf(parts[1], "%d", &backendPort)
-
-	// Build multipart form with fake audio
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	part, _ := writer.CreateFormFile("file", "audio.wav")
-	part.Write([]byte("fake-audio-data"))
-	writer.WriteField("model", "whisper-large-v3")
-	writer.Close()
+	_, _ = part.Write([]byte("fake-audio-data"))
+	_ = writer.WriteField("model", "whisper-large-v3")
+	_ = writer.Close()
 
-	// We can't easily override the port constant, but we can test auth/routing
 	h := newTestHandler(
-		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockJWT{err: fmt.Errorf("should not validate JWT for gateway token")},
 		&mockRegistry{vm: &registry.VMInfo{
-			CustomerID:  "cust-1",
-			UserID:      "user-1",
-			TailnetIP:   strPtr(backendHost),
-			GatewayPort: backendPort,
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayToken: strPtr("gw-direct-token"),
 		}},
 	)
 
 	req := httptest.NewRequest("POST", "/vm/cust-1/v1/audio/transcriptions", &body)
-	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Authorization", "Bearer gw-direct-token")
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
 
-	// Port mismatch means 502 — that's expected. Auth passed.
-	_ = receivedPath
-	_ = receivedContentType
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%q", w.Code, w.Body.String())
+	}
+	if receivedPath != "/v1/audio/transcriptions" {
+		t.Fatalf("received path = %q, want /v1/audio/transcriptions", receivedPath)
+	}
+	if !strings.HasPrefix(receivedContentType, "multipart/form-data; boundary=") {
+		t.Fatalf("content-type = %q, want multipart/form-data with boundary", receivedContentType)
+	}
+	if !bytes.Contains(receivedBody, []byte("fake-audio-data")) {
+		t.Fatal("backend did not receive multipart audio payload")
+	}
+	if receivedAuth != "" {
+		t.Fatalf("authorization header leaked to backend: %q", receivedAuth)
+	}
 }
 
-func TestHandleAudioProxy_ForwardsTTS(t *testing.T) {
+func TestHandleAudioProxy_ForwardsTTSSuccess(t *testing.T) {
+	var receivedPath string
+	var receivedBody []byte
+
+	cleanup := startSpeachesTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ID3fake-mp3"))
+	}))
+	defer cleanup()
+
 	h := newTestHandler(
-		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
+		&mockJWT{err: fmt.Errorf("should not validate JWT for gateway token")},
 		&mockRegistry{vm: &registry.VMInfo{
-			CustomerID:  "cust-1",
-			UserID:      "user-1",
-			TailnetIP:   strPtr("127.0.0.1"),
-			GatewayPort: 59999,
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayToken: strPtr("gw-direct-token"),
 		}},
 	)
 
 	body := strings.NewReader(`{"model":"tts-1","input":"hello","voice":"nova"}`)
 	req := httptest.NewRequest("POST", "/vm/cust-1/v1/audio/speech", body)
-	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Authorization", "Bearer gw-direct-token")
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleAudioProxy(w, req)
 
-	// Auth should pass (502 expected because no TTS server)
-	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
-		t.Errorf("auth should pass for TTS, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%q", w.Code, w.Body.String())
+	}
+	if receivedPath != "/v1/audio/speech" {
+		t.Fatalf("received path = %q, want /v1/audio/speech", receivedPath)
+	}
+	if !bytes.Equal(w.Body.Bytes(), []byte("ID3fake-mp3")) {
+		t.Fatalf("response body = %q, want fake mp3 bytes", w.Body.Bytes())
+	}
+	if !bytes.Contains(receivedBody, []byte(`"input":"hello"`)) {
+		t.Fatalf("backend did not receive TTS JSON body: %q", receivedBody)
 	}
 }
 
@@ -293,12 +356,11 @@ func TestHandleAudioProxy_ForwardsTTS(t *testing.T) {
 func TestServeHTTP_RoutesToAudioProxy(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{err: fmt.Errorf("no token")},
-		&mockRegistry{},
+		&mockRegistry{vm: &registry.VMInfo{CustomerID: "cust-1", UserID: "user-1", TailnetIP: strPtr("127.0.0.1")}},
 	)
 	server := httptest.NewServer(h)
 	defer server.Close()
 
-	// No auth → 401 proves routing worked
 	req, _ := http.NewRequest("POST", server.URL+"/vm/cust-1/v1/audio/transcriptions", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -314,7 +376,7 @@ func TestServeHTTP_RoutesToAudioProxy(t *testing.T) {
 func TestServeHTTP_AudioSpeechRoute(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{err: fmt.Errorf("no token")},
-		&mockRegistry{},
+		&mockRegistry{vm: &registry.VMInfo{CustomerID: "cust-1", UserID: "user-1", TailnetIP: strPtr("127.0.0.1")}},
 	)
 	server := httptest.NewServer(h)
 	defer server.Close()
@@ -334,12 +396,11 @@ func TestServeHTTP_AudioSpeechRoute(t *testing.T) {
 func TestServeHTTP_AudioNotConfusedWithUI(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{},
-		&mockRegistry{vm: nil},
+		&mockRegistry{vm: &registry.VMInfo{CustomerID: "cust-1", UserID: "user-1", TailnetIP: strPtr("127.0.0.1")}},
 	)
 	server := httptest.NewServer(h)
 	defer server.Close()
 
-	// Audio path with no auth → 401 (not redirect to login)
 	req, _ := http.NewRequest("POST", server.URL+"/vm/cust-1/v1/audio/transcriptions", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
