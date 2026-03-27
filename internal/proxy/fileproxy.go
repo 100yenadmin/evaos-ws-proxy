@@ -4,18 +4,106 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httputil"
 	"net/url"
 	"path"
 	"strings"
+	"sync"
+	"time"
 )
 
 // maxFileBodySize limits file uploads through the proxy to 100MB.
 const maxFileBodySize = 100 << 20 // 100 MiB
 
-// fileBrowserPort is the port where File Browser (filebrowser.org) runs on each VM.
-// File Browser runs in noauth mode — the proxy is the sole auth layer.
-const fileBrowserPort = 8890
+// filegatorPort is the port where Filegator runs on each VM.
+const filegatorPort = 8891
+
+type filegatorSession struct {
+	Cookie    string
+	CSRFToken string
+	ExpiresAt time.Time
+}
+
+type filegatorSessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]*filegatorSession // key: customer_id
+}
+
+var globalFilegatorSessions = &filegatorSessionStore{
+	sessions: make(map[string]*filegatorSession),
+}
+
+func (s *filegatorSessionStore) get(customerID string) *filegatorSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.sessions[customerID]
+	if sess == nil || time.Now().After(sess.ExpiresAt) {
+		return nil
+	}
+	return sess
+}
+
+func (s *filegatorSessionStore) set(customerID string, sess *filegatorSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions[customerID] = sess
+}
+
+func bootstrapFilegatorSession(vmIP, customerID string) (*filegatorSession, error) {
+	base := fmt.Sprintf("http://%s:%d", vmIP, filegatorPort)
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar, Timeout: 15 * time.Second}
+
+	resp, err := client.Get(base + "/")
+	if err != nil {
+		return nil, fmt.Errorf("filegator init GET failed: %w", err)
+	}
+	resp.Body.Close()
+	csrf := resp.Header.Get("X-CSRF-Token")
+
+	loginBody := `{"username":"customer","password":"customer123456"}`
+	req, _ := http.NewRequest("POST", base+"/?r=/login", strings.NewReader(loginBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("filegator login failed: %w", err)
+	}
+	resp.Body.Close()
+	newCSRF := resp.Header.Get("X-CSRF-Token")
+	if newCSRF != "" {
+		csrf = newCSRF
+	}
+
+	baseURL, _ := url.Parse(base)
+	cookies := jar.Cookies(baseURL)
+	var sessionCookie string
+	for _, c := range cookies {
+		if c.Name == "filegator" {
+			sessionCookie = c.Value
+			break
+		}
+	}
+	if sessionCookie == "" {
+		return nil, fmt.Errorf("filegator session cookie not found after login")
+	}
+
+	return &filegatorSession{
+		Cookie:    sessionCookie,
+		CSRFToken: csrf,
+		ExpiresAt: time.Now().Add(15 * time.Minute),
+	}, nil
+}
+
+func mapFilegatorPath(fullPath, customerID string) string {
+	prefix := "/vm/" + customerID + "/files"
+	stripped := strings.TrimPrefix(fullPath, prefix)
+	if stripped == "" || stripped == "/" {
+		return "/"
+	}
+	return stripped
+}
 
 // HandleFileProxy serves files from a customer's VM via File Browser (filebrowser.org).
 // Route: /vm/{customer_id}/files/{path...}
@@ -24,10 +112,6 @@ const fileBrowserPort = 8890
 // The /vm/{customer_id} prefix is stripped; /files/* is passed through as-is
 // since File Browser is configured with baseURL=/files.
 func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
-	// File Browser uses GET, HEAD, POST, PUT, PATCH, DELETE for its full UI.
-	// Allow all standard methods.
-
-	// Limit request body size for mutating methods to prevent abuse
 	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 		r.Body = http.MaxBytesReader(w, r.Body, maxFileBodySize)
 	}
@@ -38,11 +122,9 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Auth (identical to HandleHTTPProxy non-UI path) ---
 	var userID string
 	var authedViaSession bool
 
-	// 1. Check session cookie
 	if h.sessions != nil {
 		if sessionToken := GetSessionCookie(r); sessionToken != "" {
 			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
@@ -56,7 +138,6 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				}
-				// Renew cookie if close to expiry
 				if authedViaSession && h.sessions.ShouldRenew(sessionClaims) {
 					if renewed, err := h.sessions.RenewSessionToken(sessionClaims); err == nil {
 						h.sessions.SetSessionCookie(w, renewed)
@@ -66,7 +147,6 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Fall back to JWT
 	if !authedViaSession {
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
@@ -82,7 +162,6 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		userID = claims.UserID
 
-		// Verify ownership
 		vm, err := h.vms.LookupByCustomerID(customerID)
 		if err != nil {
 			slog.Error("file proxy vm lookup failed", "error", err, "customer_id", customerID)
@@ -99,7 +178,6 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// --- VM lookup ---
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil {
 		slog.Error("file proxy vm lookup failed", "error", err, "customer_id", customerID)
@@ -111,21 +189,28 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Build file path ---
-	// Strip /vm/{customer_id} prefix, keep /files/* intact.
-	// File Browser is configured with baseurl=/files, so it expects /files/... paths.
-	backendPath := stripVMPrefix(r.URL.Path, customerID)
-	// Clean the path to prevent traversal via encoded dots (%2e%2e)
-	backendPath = path.Clean(backendPath)
-	// backendPath is now "/files/..." — pass it through as-is.
-	filePath := backendPath
-	if filePath == "" || filePath == "." {
-		filePath = "/files/"
+	session := globalFilegatorSessions.get(customerID)
+	if session == nil {
+		session, err = bootstrapFilegatorSession(vm.EffectiveIP(), customerID)
+		if err != nil {
+			slog.Error("filegator session bootstrap failed", "error", err, "customer_id", customerID, "vm_ip", vm.EffectiveIP())
+			http.Error(w, "file server unavailable", http.StatusBadGateway)
+			return
+		}
+		globalFilegatorSessions.set(customerID, session)
 	}
-	// Verify the cleaned path still starts with /files to prevent traversal escape
-	if !strings.HasPrefix(filePath, "/files") {
+
+	mappedPath := mapFilegatorPath(r.URL.Path, customerID)
+	if strings.Contains(mappedPath, "..") {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
+	}
+	filePath := path.Clean(mappedPath)
+	if filePath == "." || filePath == "" {
+		filePath = "/"
+	}
+	if !strings.HasPrefix(filePath, "/") {
+		filePath = "/" + filePath
 	}
 
 	logger := slog.With(
@@ -135,10 +220,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		"file_path", filePath,
 	)
 
-	// --- Reverse proxy to File Browser (port 8890, noauth) ---
-	// File Browser runs standalone on the VM, NOT behind the OpenClaw gateway.
-	// Auth is handled entirely by the proxy (Supabase JWT/session above).
-	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), fileBrowserPort)
+	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), filegatorPort)
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		logger.Error("invalid file server URL", "url", backendURL, "error", err)
@@ -146,37 +228,39 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.Debug("proxying file request", "backend", backendURL, "file_path", filePath)
+	logger.Debug("proxying filegator request", "backend", backendURL, "file_path", filePath)
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.URL.Path = filePath
-			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
+			req.URL.RawPath = filePath
+			req.URL.RawQuery = r.URL.RawQuery
 			req.Host = target.Host
+			req.RequestURI = ""
 
-			// Set forwarding headers
 			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
-
-			// Remove browser auth headers — File Browser runs noauth,
-			// no credentials needed. Stripping prevents accidental leaks.
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
+			req.Header.Set("Cookie", "filegator="+session.Cookie)
+			if session.CSRFToken != "" {
+				req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// Set CORS headers for file downloads
+			resp.Header.Del("X-Frame-Options")
+			resp.Header.Del("Set-Cookie")
+			resp.Header.Set("Content-Security-Policy", "frame-ancestors 'self' https://ecs.electricsheephq.com")
+
 			origin := r.Header.Get("Origin")
 			if origin != "" && allowedOrigins[origin] {
 				resp.Header.Set("Access-Control-Allow-Origin", origin)
 			}
-
-			// Cache shared files for 5 minutes
 			if resp.Header.Get("Cache-Control") == "" {
 				resp.Header.Set("Cache-Control", "private, max-age=300")
 			}
-
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -264,7 +348,7 @@ func (h *Handler) HandleBareFileProxy(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Proxy to File Browser on port 8890
-	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), fileBrowserPort)
+	backendURL := fmt.Sprintf("http://%s:%d", vm.EffectiveIP(), filegatorPort)
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		logger.Error("invalid file server URL", "url", backendURL, "error", err)

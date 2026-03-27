@@ -5,11 +5,21 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/100yenadmin/evaos-ws-proxy/internal/auth"
 	"github.com/100yenadmin/evaos-ws-proxy/internal/registry"
 )
+
+func seedFilegatorSession(customerID string) {
+	globalFilegatorSessions.set(customerID, &filegatorSession{
+		Cookie:    "test-session",
+		CSRFToken: "test-csrf",
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+	})
+}
 
 // --- File Proxy Route Tests ---
 
@@ -71,6 +81,7 @@ func TestHandleFileProxy_Forbidden(t *testing.T) {
 
 func TestHandleFileProxy_PostAllowed(t *testing.T) {
 	// File Browser needs POST/PUT/DELETE for file management
+	seedFilegatorSession("cust-1")
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
@@ -91,12 +102,12 @@ func TestHandleFileProxy_PostAllowed(t *testing.T) {
 }
 
 func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
+	seedFilegatorSession("cust-1")
 	var receivedPath string
 	var receivedHeaders http.Header
 
-	// Mock file server on port 8890 (File Browser port).
-	// The file proxy hardcodes fileBrowserPort=8890, so we must listen there.
-	listener, err := net.Listen("tcp", "127.0.0.1:8890")
+	// Mock Filegator server on port 8891.
+	listener, err := net.Listen("tcp", "127.0.0.1:8891")
 	if err != nil {
 		t.Skipf("cannot bind to port 8890 (may be in use): %v", err)
 	}
@@ -111,9 +122,6 @@ func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
 	fileServer.Listener = listener
 	fileServer.Start()
 	defer fileServer.Close()
-
-	// The file proxy uses fileBrowserPort (8890), so our mock VM just needs
-	// the correct IP (127.0.0.1). GatewayPort is irrelevant for file proxy.
 
 	// Test: verify the handler calls through correctly with session auth
 	secret := "test-file-secret"
@@ -142,17 +150,22 @@ func TestHandleFileProxy_ForwardsRequest(t *testing.T) {
 	h.HandleFileProxy(w, req)
 
 	// Verify the request was forwarded to our mock server with correct path
-	if receivedPath != "/files/reports/q1.pdf" {
-		t.Errorf("expected backend path /files/reports/q1.pdf, got %s", receivedPath)
+	if receivedPath != "/reports/q1.pdf" {
+		t.Errorf("expected backend path /reports/q1.pdf, got %s", receivedPath)
 	}
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	// Verify gateway token was injected (EffectiveToken returns "" for test VMInfo without GatewayToken)
-	_ = receivedHeaders
+	if got := receivedHeaders.Get("Cookie"); !strings.Contains(got, "filegator=test-session") {
+		t.Errorf("expected filegator cookie injection, got %q", got)
+	}
+	if got := receivedHeaders.Get("X-CSRF-Token"); got != "test-csrf" {
+		t.Errorf("expected CSRF header injection, got %q", got)
+	}
 }
 
 func TestHandleFileProxy_SessionAuth(t *testing.T) {
+	seedFilegatorSession("cust-1")
 	secret := "test-file-session"
 	sm := NewSessionManager([]byte(secret))
 	token, _ := sm.GenerateSessionToken(SessionClaims{
@@ -183,6 +196,7 @@ func TestHandleFileProxy_SessionAuth(t *testing.T) {
 }
 
 func TestHandleFileProxy_AdminAccess(t *testing.T) {
+	seedFilegatorSession("cust-1")
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "admin-user", Email: "admin@100yen.org"}},
 		&mockRegistry{vm: &registry.VMInfo{
@@ -263,6 +277,7 @@ func TestServeHTTP_FilesPathNotConfusedWithUI(t *testing.T) {
 }
 
 func TestHandleFileProxy_PathTraversal(t *testing.T) {
+	seedFilegatorSession("cust-1")
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
@@ -290,6 +305,7 @@ func TestHandleFileProxy_PathTraversal(t *testing.T) {
 }
 
 func TestHandleFileProxy_HeadMethod(t *testing.T) {
+	seedFilegatorSession("cust-1")
 	h := newTestHandler(
 		&mockJWT{claims: &auth.Claims{UserID: "user-1", Email: "test@test.com"}},
 		&mockRegistry{vm: &registry.VMInfo{
