@@ -165,11 +165,16 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 			req.URL.RawQuery = stripTokenParam(r.URL.RawQuery)
 			req.Host = target.Host
 
-			// Forwarding metadata only; never leak caller credentials to Speaches.
+			// Forwarding metadata + VM-scoped backend auth.
 			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
-			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
+			if token := vm.EffectiveToken(); token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("X-OpenClaw-Token", token)
+			} else {
+				req.Header.Del("Authorization")
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			origin := r.Header.Get("Origin")

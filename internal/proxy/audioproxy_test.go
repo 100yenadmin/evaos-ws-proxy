@@ -302,8 +302,8 @@ func TestHandleAudioProxy_ForwardsSTTMultipart(t *testing.T) {
 	if !bytes.Contains(receivedBody, []byte("fake-audio-data")) {
 		t.Fatal("backend did not receive multipart audio payload")
 	}
-	if receivedAuth != "" {
-		t.Fatalf("authorization header leaked to backend: %q", receivedAuth)
+	if receivedAuth != "Bearer gw-direct-token" {
+		t.Fatalf("authorization header = %q, want backend gateway token", receivedAuth)
 	}
 }
 
