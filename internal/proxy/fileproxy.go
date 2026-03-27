@@ -131,6 +131,7 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
+		slog.Info("file proxy: invalid customer_id", "path", r.URL.Path, "customer_id", customerID)
 		http.Error(w, "invalid customer_id", http.StatusBadRequest)
 		return
 	}
@@ -139,14 +140,32 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 	var authedViaSession bool
 
 	if h.sessions != nil {
-		if sessionToken := GetSessionCookie(r); sessionToken != "" {
-			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
+		sessionToken := GetSessionCookie(r)
+		slog.Info("file proxy: auth check",
+			"customer_id", customerID,
+			"path", r.URL.Path,
+			"has_session_cookie", sessionToken != "",
+			"remote_addr", r.RemoteAddr)
+		if sessionToken != "" {
+			sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken)
+			if err != nil {
+				slog.Info("file proxy: session cookie invalid", "error", err, "customer_id", customerID)
+			} else {
 				vm, err := h.vms.LookupByCustomerID(customerID)
+				slog.Info("file proxy: vm lookup",
+					"customer_id", customerID,
+					"vm_found", vm != nil,
+					"lookup_err", err,
+					"session_user_id", sessionClaims.UserID)
 				if err == nil && vm != nil {
 					if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
 						userID = sessionClaims.UserID
 						authedViaSession = true
 					} else {
+						slog.Warn("file proxy: ownership mismatch",
+							"session_user", sessionClaims.UserID,
+							"vm_user", vm.UserID,
+							"customer_id", customerID)
 						http.Error(w, "forbidden", http.StatusForbidden)
 						return
 					}
@@ -158,10 +177,13 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	} else {
+		slog.Warn("file proxy: no session manager")
 	}
 
 	if !authedViaSession {
 		tokenStr := extractToken(r)
+		slog.Info("file proxy: fallback to token", "has_token", tokenStr != "", "customer_id", customerID)
 		if tokenStr == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
