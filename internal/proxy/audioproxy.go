@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"time"
 )
 
 // maxAudioBodySize limits multipart STT uploads to 25MB (matches OpenAI's limit).
@@ -157,6 +158,10 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 
 	logger.Debug("proxying audio request", "backend", backendURL, "path", backendPath)
 
+	// STT can take noticeably longer than UI/plugin requests before the backend writes headers.
+	audioTransport := h.httpTransport.Clone()
+	audioTransport.ResponseHeaderTimeout = 2 * time.Minute
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
@@ -187,7 +192,7 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 			logger.Error("audio proxy backend error", "error", err)
 			http.Error(w, "audio service unavailable", http.StatusBadGateway)
 		},
-		Transport: h.httpTransport,
+		Transport: audioTransport,
 	}
 
 	proxy.ServeHTTP(w, r)
