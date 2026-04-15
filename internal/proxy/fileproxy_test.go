@@ -195,6 +195,37 @@ func TestHandleFileProxy_SessionAuth(t *testing.T) {
 	}
 }
 
+func TestHandleFileProxy_SessionAuthWrongCustomer_Unauthorized(t *testing.T) {
+	seedFilegatorSession("cust-1")
+	secret := "test-file-session"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID:     "user-1",
+		Email:      "test@test.com",
+		CustomerID: "cust-other",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999,
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/files/test.txt", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
+	w := httptest.NewRecorder()
+	h.HandleFileProxy(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong-customer session, got %d", w.Code)
+	}
+}
+
 func TestHandleFileProxy_AdminAccess(t *testing.T) {
 	seedFilegatorSession("cust-1")
 	h := newTestHandler(
