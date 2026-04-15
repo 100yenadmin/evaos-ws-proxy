@@ -86,7 +86,12 @@ func (h *Handler) HandleAudioProxy(w http.ResponseWriter, r *http.Request) {
 	if h.sessions != nil {
 		if sessionToken := GetSessionCookie(r); sessionToken != "" {
 			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
-				if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
+				if !h.sessionCustomerMatches(sessionClaims, customerID) {
+					slog.Info("audio proxy: session customer mismatch",
+						"session_customer_id", sessionClaims.CustomerID,
+						"route_customer_id", customerID,
+						"remote_addr", r.RemoteAddr)
+				} else if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
 					userID = sessionClaims.UserID
 					authedViaSession = true
 				} else {

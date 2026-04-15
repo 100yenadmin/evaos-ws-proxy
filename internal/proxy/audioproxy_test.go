@@ -131,6 +131,36 @@ func TestHandleAudioProxy_SessionAuth(t *testing.T) {
 	}
 }
 
+func TestHandleAudioProxy_SessionWrongCustomer_Unauthorized(t *testing.T) {
+	secret := "test-audio-session"
+	sm := NewSessionManager([]byte(secret))
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID:     "user-1",
+		Email:      "test@test.com",
+		CustomerID: "cust-other",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "user-1",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 59999,
+		}},
+		secret,
+	)
+
+	req := httptest.NewRequest("POST", "/vm/cust-1/v1/audio/transcriptions", nil)
+	req.AddCookie(&http.Cookie{Name: "evaos_session", Value: token})
+	w := httptest.NewRecorder()
+	h.HandleAudioProxy(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong-customer session, got %d", w.Code)
+	}
+}
+
 func TestHandleAudioProxy_GatewayTokenAuth(t *testing.T) {
 	h := newTestHandler(
 		&mockJWT{err: fmt.Errorf("should not validate JWT for gateway token")},

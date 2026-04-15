@@ -1881,6 +1881,40 @@ func TestHandleHTTPProxy_SessionCookie_WrongCustomer_RedirectsToLogout(t *testin
 	}
 }
 
+func TestHandleWSProxy_SessionQuery_WrongCustomer_Unauthorized(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	token, _ := sm.GenerateSessionToken(SessionClaims{
+		UserID:     "admin-user",
+		Email:      "admin@100yen.org",
+		Roles:      []string{"admin"},
+		CustomerID: "cust-other",
+	})
+
+	h := newTestHandlerWithSessions(
+		&mockJWT{},
+		&mockRegistry{vm: &registry.VMInfo{
+			CustomerID:  "cust-1",
+			UserID:      "other-user",
+			TailnetIP:   strPtr("127.0.0.1"),
+			GatewayPort: 9999,
+		}},
+		secret,
+		func(cfg *HandlerConfig) {
+			cfg.AdminEmails = []string{"admin@100yen.org"}
+		},
+	)
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/ui/ws?session="+url.QueryEscape(token), nil)
+	w := httptest.NewRecorder()
+	h.HandleWebSocket(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
 func TestHandleWSProxy_SessionCookie_WrongCustomer_Unauthorized(t *testing.T) {
 	secret := "test-session-secret"
 	sm := NewSessionManager([]byte(secret))
@@ -1993,6 +2027,42 @@ func TestHandleAuthCallback_ValidCallbackToken(t *testing.T) {
 	}
 	if !foundGwToken {
 		t.Error("expected evaos_gw_token cookie to be set")
+	}
+}
+
+func TestHandleAuthCallback_WrongCustomer_Forbidden(t *testing.T) {
+	secret := "test-session-secret"
+	sm := NewSessionManager([]byte(secret))
+
+	cbToken, _ := sm.GenerateCallbackToken(SessionClaims{
+		UserID:     "user-1",
+		Email:      "test@test.com",
+		CustomerID: "cust-other",
+	})
+
+	h := NewHandler(HandlerConfig{
+		JWTValidator: &mockJWT{},
+		VMRegistry: &mockRegistry{vm: &registry.VMInfo{
+			CustomerID:   "cust-1",
+			UserID:       "user-1",
+			TailnetIP:    strPtr("127.0.0.1"),
+			GatewayToken: strPtr("test-gw-token"),
+		}},
+		Health:         health.NewHandler(),
+		MaxConnections: 100,
+		ConnectTimeout: 5 * time.Second,
+		SessionManager: sm,
+	})
+
+	req := httptest.NewRequest("GET", "/vm/cust-1/auth/callback?session="+cbToken, nil)
+	w := httptest.NewRecorder()
+	h.HandleAuthCallback(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for wrong-customer callback token, got %d", w.Code)
+	}
+	if cookies := w.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("expected no cookies to be set, got %d", len(cookies))
 	}
 }
 

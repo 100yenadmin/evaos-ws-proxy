@@ -895,6 +895,15 @@ func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.sessionCustomerMatches(claims, customerID) {
+		slog.Info("auth callback: session customer mismatch",
+			"session_customer_id", claims.CustomerID,
+			"route_customer_id", customerID,
+			"remote_addr", r.RemoteAddr)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	// Verify ownership/admin for this customer
 	vm, err := h.vms.LookupByCustomerID(customerID)
 	if err != nil || vm == nil {

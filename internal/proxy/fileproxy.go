@@ -150,6 +150,11 @@ func (h *Handler) HandleFileProxy(w http.ResponseWriter, r *http.Request) {
 			sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken)
 			if err != nil {
 				slog.Info("file proxy: session cookie invalid", "error", err, "customer_id", customerID)
+			} else if !h.sessionCustomerMatches(sessionClaims, customerID) {
+				slog.Info("file proxy: session customer mismatch",
+					"session_customer_id", sessionClaims.CustomerID,
+					"route_customer_id", customerID,
+					"remote_addr", r.RemoteAddr)
 			} else {
 				vm, err := h.vms.LookupByCustomerID(customerID)
 				slog.Info("file proxy: vm lookup",
