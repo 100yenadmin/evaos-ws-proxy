@@ -180,11 +180,18 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if h.sessions != nil {
 		if sessionToken := GetSessionCookie(r); sessionToken != "" {
 			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
-				claims = &auth.Claims{
-					UserID: sessionClaims.UserID,
-					Email:  sessionClaims.Email,
+				if h.sessionCustomerMatches(sessionClaims, customerID) {
+					claims = &auth.Claims{
+						UserID: sessionClaims.UserID,
+						Email:  sessionClaims.Email,
+					}
+					authedViaSessionWS = true
+				} else {
+					slog.Info("ws session customer mismatch",
+						"session_customer_id", sessionClaims.CustomerID,
+						"route_customer_id", customerID,
+						"remote_addr", r.RemoteAddr)
 				}
-				authedViaSessionWS = true
 			}
 		}
 	}
@@ -194,11 +201,18 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if h.sessions != nil {
 			if sessionParam := r.URL.Query().Get("session"); sessionParam != "" {
 				if sessionClaims, err := h.sessions.ValidateSessionToken(sessionParam); err == nil {
-					claims = &auth.Claims{
-						UserID: sessionClaims.UserID,
-						Email:  sessionClaims.Email,
+					if h.sessionCustomerMatches(sessionClaims, customerID) {
+						claims = &auth.Claims{
+							UserID: sessionClaims.UserID,
+							Email:  sessionClaims.Email,
+						}
+						authedViaSessionWS = true
+					} else {
+						slog.Info("ws query session customer mismatch",
+							"session_customer_id", sessionClaims.CustomerID,
+							"route_customer_id", customerID,
+							"remote_addr", r.RemoteAddr)
 					}
-					authedViaSessionWS = true
 				}
 			}
 		}
@@ -580,6 +594,7 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 
 	var userID string
 	var authedViaSession bool
+	var sessionMismatch bool
 
 	// Auth strategy:
 	// 1. Check evaos_session cookie first (fast path for repeat visits)
@@ -588,26 +603,35 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	if h.sessions != nil {
 		if sessionToken := GetSessionCookie(r); sessionToken != "" {
 			if sessionClaims, err := h.sessions.ValidateSessionToken(sessionToken); err == nil {
-				// Valid session — verify ownership/admin if VM exists
-				vm, err := h.vms.LookupByCustomerID(customerID)
-				if err == nil && vm != nil {
-					if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
+				if !h.sessionCustomerMatches(sessionClaims, customerID) {
+					sessionMismatch = true
+					h.sessions.ClearSessionCookie(w)
+					slog.Info("http session customer mismatch",
+						"session_customer_id", sessionClaims.CustomerID,
+						"route_customer_id", customerID,
+						"remote_addr", r.RemoteAddr)
+				} else {
+					// Valid session — verify ownership/admin if VM exists
+					vm, err := h.vms.LookupByCustomerID(customerID)
+					if err == nil && vm != nil {
+						if sessionClaims.UserID == vm.UserID || h.isAdmin(sessionClaims.Email) {
+							userID = sessionClaims.UserID
+							authedViaSession = true
+						} else {
+							http.Error(w, "forbidden", http.StatusForbidden)
+							return
+						}
+					} else {
+						// VM not found or lookup error — user is still authenticated,
+						// let the request through to show maintenance/provisioning page
 						userID = sessionClaims.UserID
 						authedViaSession = true
-					} else {
-						http.Error(w, "forbidden", http.StatusForbidden)
-						return
 					}
-				} else {
-					// VM not found or lookup error — user is still authenticated,
-					// let the request through to show maintenance/provisioning page
-					userID = sessionClaims.UserID
-					authedViaSession = true
-				}
-				// Renew cookie if close to expiry
-				if authedViaSession && h.sessions.ShouldRenew(sessionClaims) {
-					if renewed, err := h.sessions.RenewSessionToken(sessionClaims); err == nil {
-						h.sessions.SetSessionCookie(w, renewed)
+					// Renew cookie if close to expiry
+					if authedViaSession && h.sessions.ShouldRenew(sessionClaims) {
+						if renewed, err := h.sessions.RenewSessionToken(sessionClaims); err == nil {
+							h.sessions.SetSessionCookie(w, renewed)
+						}
 					}
 				}
 			}
@@ -619,10 +643,15 @@ func (h *Handler) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		tokenStr := extractToken(r)
 		if tokenStr == "" {
 			if isUIPath {
-				// Redirect to login page for UI paths
-				loginURL := fmt.Sprintf("https://www.electricsheephq.com/login?redirect=/vm/%s/ui/",
-					url.PathEscape(customerID))
-				http.Redirect(w, r, loginURL, http.StatusFound)
+				if sessionMismatch {
+					logoutURL := fmt.Sprintf("/vm/%s/auth/logout", url.PathEscape(customerID))
+					http.Redirect(w, r, logoutURL, http.StatusFound)
+				} else {
+					// Redirect to login page for UI paths
+					loginURL := fmt.Sprintf("https://www.electricsheephq.com/login?redirect=/vm/%s/ui/",
+						url.PathEscape(customerID))
+					http.Redirect(w, r, loginURL, http.StatusFound)
+				}
 			} else {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 			}
@@ -829,6 +858,16 @@ func addCacheHeaders(resp *http.Response) {
 // HandleAuthCallback handles GET /vm/{cid}/auth/callback?session=TOKEN.
 // H-1 fix: The token in the URL is now a short-lived callback token (30s, single-use).
 // It gets exchanged for the real session token which is set as a cookie.
+func (h *Handler) sessionCustomerMatches(sessionClaims *SessionClaims, routeCustomerID string) bool {
+	if sessionClaims == nil {
+		return false
+	}
+	if sessionClaims.CustomerID == "" {
+		return true
+	}
+	return sessionClaims.CustomerID == routeCustomerID
+}
+
 func (h *Handler) HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	customerID := extractCustomerID(r.URL.Path)
 	if customerID == "" || !customerIDPattern.MatchString(customerID) {
